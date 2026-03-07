@@ -295,7 +295,6 @@ def get_model(dataset, model_type, item_count, batch_size, hidden_size, interest
                               add_pos=False,
                               beta=args.rbeta,
                               use_overlapped_partition=getattr(args, 'use_overlapped_partition', 0) == 1,
-                              partition_temperature=getattr(args, 'partition_temperature', 1.0),
                               args=args,
                               device=device)
         # Wrap with DASD_DisMIR for knowledge distillation
