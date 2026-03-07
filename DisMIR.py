@@ -90,7 +90,7 @@ class DisMIR(BasicModel):
     def __init__(self, item_num, hidden_size, batch_size, interest_num=4,
                  seq_len=20, partition_groups=64, lambda_coef=0.1,
                  num_negatives=100, hard_neg_candidates=10, add_pos=False, beta=0,
-                 use_overlapped_partition=False, partition_temperature=1.0,
+                 use_overlapped_partition=False,
                  args=None, device=None):
         """
         [PAPER_REF] Section 5.1.4: hidden_size = partition_groups = 64
@@ -108,7 +108,7 @@ class DisMIR(BasicModel):
             add_pos: Whether to add positional encoding (not used in DisMIR)
             beta: IHN temperature parameter
             use_overlapped_partition: Whether to use overlapped partition [PAPER_REF] Sec 4.1.2
-            partition_temperature: Temperature for softmax in overlapped partition
+                NOTE: Paper uses raw embeddings as w_ik (no softmax, no temperature)
             args: Additional arguments
             device: Computation device
         """
@@ -129,10 +129,10 @@ class DisMIR(BasicModel):
         self.device = device
 
         # [Overlapped Partition] Configuration
+        # [PAPER_REF] Sec 4.1.2: w_ik ∈ ℝ (real values), learned directly without softmax
         self.use_overlapped_partition = use_overlapped_partition
-        self.partition_temperature = partition_temperature
         if use_overlapped_partition:
-            print(f"[DisMIR] Using Overlapped Partition (temperature={partition_temperature})")
+            print(f"[DisMIR] Using Overlapped Partition (w_ik ∈ ℝ, no softmax)")
 
         # Confidence matrix for item-item relationships
         self.confidence_matrix = None
@@ -249,7 +249,9 @@ class DisMIR(BasicModel):
 
         Supports both Non-overlapped and Overlapped partition:
         - Non-overlapped (default): w_ik ∈ {0,1}, hard partition assignment
-        - Overlapped: w_ik ∈ ℝ, soft partition weights via softmax [PAPER_REF] Eq (4)
+        - Overlapped: w_ik ∈ ℝ, soft partition weights [PAPER_REF] Eq (4)
+        NOTE: Paper does NOT use softmax or temperature for partition weights.
+              w_ik are learned directly as real values.
 
         Args:
             items: (batch_size, seq_len) item ids
@@ -268,16 +270,11 @@ class DisMIR(BasicModel):
         # Flatten for batch processing (B*L, K)
         item_eb_flat = item_eb.view(-1, self.partition_groups)
 
-        # [Overlapped Partition] Apply softmax to get soft partition weights w_ik
-        # [PAPER_REF] Eq (4): w_ik ∈ ℝ, representing the degree of item i belonging to group k
-        if self.use_overlapped_partition:
-            # Normalize with temperature to control sharpness of partition
-            # Higher temperature -> more uniform distribution (more overlapping)
-            # Lower temperature -> more peaked distribution (less overlapping)
-            item_weights = F.softmax(item_eb_flat / self.partition_temperature, dim=-1)
-        else:
-            # Non-overlapped: use raw embeddings (implicitly binary through training)
-            item_weights = item_eb_flat
+        # [PAPER_REF] Eq (4): w_ik ∈ ℝ (real values)
+        # Both overlapped and non-overlapped use raw embeddings as partition weights
+        # The difference is conceptual: overlapped allows w_ik to be any real value,
+        # while non-overlapped encourages binary values through training dynamics
+        item_weights = item_eb_flat
 
         # Sample positive neighbors from confidence matrix
         pos_samples = self.sample_positive_neighbors(items, num_pos=1)  # (B, L, 1)
@@ -290,44 +287,21 @@ class DisMIR(BasicModel):
                                     device=items.device)
         neg_eb = self.embeddings(neg_samples)  # (B*L, N, K)
 
-        # [Overlapped Partition] Apply softmax to positive and negative samples
-        if self.use_overlapped_partition:
-            pos_weights = F.softmax(pos_eb / self.partition_temperature, dim=-1)
-            # Reshape neg_eb for softmax: (B*L, N, K) -> (B*L*N, K)
-            neg_eb_flat = neg_eb.view(-1, self.partition_groups)
-            neg_weights = F.softmax(neg_eb_flat / self.partition_temperature, dim=-1)
-            # Reshape back: (B*L*N, K) -> (B*L, N, K)
-            neg_weights = neg_weights.view(batch_size * seq_len, self.num_negatives, self.partition_groups)
-        else:
-            pos_weights = pos_eb
-            neg_weights = neg_eb
+        # Use raw embeddings as partition weights (w_ik)
+        pos_weights = pos_eb
+        neg_weights = neg_eb
 
-        # Compute similarities based on partition type
-        if self.use_overlapped_partition:
-            # [Overlapped] Similarity = exp(Σ_k w_ik · w_jk) as in Eq (4)
-            # This measures how much two items share the same partition membership
-            # Positive similarity: sum over partition dimension
-            pos_sim = (item_weights * pos_weights).sum(dim=-1)  # (B*L,)
+        # Compute similarities: sim(i,j) = Σ_k w_ik · w_jk as in [PAPER_REF] Eq (4)
+        # This is the standard dot product measuring partition membership overlap
+        pos_sim = (item_weights * pos_weights).sum(dim=-1)  # (B*L,)
+        neg_sim = torch.matmul(
+            item_weights.unsqueeze(1),
+            neg_weights.transpose(-2, -1)
+        ).squeeze(1)  # (B*L, N)
 
-            # Negative similarities
-            # item_weights: (B*L, K) -> (B*L, 1, K)
-            # neg_weights: (B*L, N, K)
-            neg_sim = (item_weights.unsqueeze(1) * neg_weights).sum(dim=-1)  # (B*L, N)
-        else:
-            # [Non-overlapped] Standard dot product similarity
-            pos_sim = (item_weights * pos_weights).sum(dim=-1)  # (B*L,)
-            neg_sim = torch.matmul(
-                item_weights.unsqueeze(1),
-                neg_weights.transpose(-2, -1)
-            ).squeeze(1)  # (B*L, N)
-
-        # Temperature-scaled InfoNCE loss with numerical stability
-        # For overlapped partition, use lower temperature to emphasize the partition effect
-        if self.use_overlapped_partition:
-            # Use lower temperature for sharper contrast
-            temperature = 0.5
-        else:
-            temperature = 0.5
+        # InfoNCE loss with temperature=1.0 (paper default, no temperature mentioned)
+        # [PAPER_REF] Theorem 4: log[exp(Σ_k w_ik w_jk) / Σ_j' exp(Σ_k w_ik w_j'k)]
+        temperature = 1.0
 
         # Clamp similarities to prevent overflow in exp
         pos_sim = torch.clamp(pos_sim / temperature, min=-10, max=10)
