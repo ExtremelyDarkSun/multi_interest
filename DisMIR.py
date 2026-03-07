@@ -325,21 +325,24 @@ class DisMIR(BasicModel):
 
     def compute_bpr_loss_with_hard_negative(self, user_eb, pos_items, neg_candidates=10):
         """
-        Compute BPR loss with hard negative mining
+        Compute BPR loss with hard negative mining + shared negatives (REMI-style)
         [PAPER_REF] Section 4.3: "We adopt the BPR loss with hard negative mining"
+        [Modified] Both hard loss and all loss use SHARED negatives
 
         For each positive item:
-        1. Sample N candidates (default 10 per paper)
-        2. Select the hardest negative (highest score)
-        3. Compute BPR loss: -log(sigmoid(score(pos) - score(neg)))
+        1. Sample N candidates (default 10) - SHARED across batch (REMI-style)
+        2. Compute two losses:
+           - Hard loss: against the hardest negative from SHARED negatives
+           - All loss: average over ALL N shared negatives
+        3. Total loss = hard_loss + all_loss (both weights = 1)
 
         Args:
             user_eb: (batch_size, hidden_size) user representation
             pos_items: (batch_size,) positive item ids
-            neg_candidates: Number of negative candidates to sample
+            neg_candidates: Number of negative candidates to sample (shared across batch)
 
         Returns:
-            bpr_loss: scalar tensor
+            bpr_loss: scalar tensor (hard_loss + all_loss)
         """
         batch_size = user_eb.shape[0]
 
@@ -347,38 +350,41 @@ class DisMIR(BasicModel):
         pos_eb = self.embeddings(pos_items)  # (B, D)
         pos_scores = (user_eb * pos_eb).sum(dim=-1)  # (B,)
 
-        # Sample negative candidates
-        neg_samples = torch.randint(0, self.item_num,
-                                    (batch_size, neg_candidates),
-                                    device=user_eb.device)
+        # === REMI-style: Sample shared negatives for entire batch ===
+        # Sample once, share across all samples in batch
+        shared_neg_samples = torch.randint(0, self.item_num,
+                                           (neg_candidates,),
+                                           device=user_eb.device)  # (N,)
 
-        # Get negative embeddings and scores
-        neg_eb = self.embeddings(neg_samples)  # (B, N, D)
+        # Get shared negative embeddings
+        shared_neg_eb = self.embeddings(shared_neg_samples)  # (N, D)
 
-        # Compute scores for all negatives: (B, 1, D) @ (B, D, N) -> (B, N)
-        neg_scores = torch.matmul(
-            user_eb.unsqueeze(1),
-            neg_eb.transpose(-2, -1)
-        ).squeeze(1)
+        # Compute scores for all samples against shared negatives: (B, D) @ (D, N) -> (B, N)
+        shared_neg_scores = torch.matmul(user_eb, shared_neg_eb.transpose(0, 1))  # (B, N)
 
-        # Hard negative mining: select highest scoring negative
-        hardest_neg_scores, _ = neg_scores.max(dim=-1)  # (B,)
+        # === Loss 1: Hardest negative (from shared negatives) ===
+        # Select the highest scoring negative from the shared set for each sample
+        hardest_neg_scores, _ = shared_neg_scores.max(dim=-1)  # (B,)
+        hard_diff = pos_scores - hardest_neg_scores
+        hard_diff = torch.clamp(hard_diff, min=-20, max=20)
+        hard_loss = -F.logsigmoid(hard_diff)  # (B,)
 
-        # BPR loss with numerical stability
-        # Use logsigmoid with clamp to prevent extreme values
-        diff = pos_scores - hardest_neg_scores
-        diff = torch.clamp(diff, min=-20, max=20)  # Prevent overflow in exp
+        # === Loss 2: All shared negatives (REMI-style) ===
+        pos_scores_expanded = pos_scores.unsqueeze(1)  # (B, 1)
+        all_diff = pos_scores_expanded - shared_neg_scores  # (B, N)
+        all_diff = torch.clamp(all_diff, min=-20, max=20)
+        all_loss = -F.logsigmoid(all_diff).mean(dim=-1)  # (B,)
 
-        loss = -F.logsigmoid(diff)
+        # === Combined loss ===
+        total_loss = hard_loss + all_loss  # (B,)
 
         # Check for NaN
-        if torch.isnan(loss.sum()):
+        if torch.isnan(total_loss.mean()):
             print(f"[DisMIR Warning] BPR loss is NaN")
             print(f"  pos_scores range: [{pos_scores.min():.4f}, {pos_scores.max():.4f}]")
-            print(f"  neg_scores range: [{neg_scores.min():.4f}, {neg_scores.max():.4f}]")
             return torch.tensor(0.0, device=user_eb.device)
 
-        return loss.sum()
+        return total_loss.mean()
 
     def forward(self, item_list, label_list, mask, times, device, train=True):
         """
