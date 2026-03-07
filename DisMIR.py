@@ -372,13 +372,13 @@ class DisMIR(BasicModel):
         loss = -F.logsigmoid(diff)
 
         # Check for NaN
-        if torch.isnan(loss.mean()):
+        if torch.isnan(loss.sum()):
             print(f"[DisMIR Warning] BPR loss is NaN")
             print(f"  pos_scores range: [{pos_scores.min():.4f}, {pos_scores.max():.4f}]")
             print(f"  neg_scores range: [{neg_scores.min():.4f}, {neg_scores.max():.4f}]")
             return torch.tensor(0.0, device=user_eb.device)
 
-        return loss.mean()
+        return loss.sum()
 
     def forward(self, item_list, label_list, mask, times, device, train=True):
         """
