@@ -268,17 +268,13 @@ def get_model(dataset, model_type, item_count, batch_size, hidden_size, interest
         # - dlambda (λ): [0.01, 0.1, 1.0] dataset-specific
         # - num_negatives (N_v): 100 for partition loss
         # - hard_neg_candidates: 10 for BPR hard negative mining
-        # [P1_FIX] Added new parameters: dropout, temperature, use_layer_norm
         model = DisMIR(item_count, hidden_size, batch_size, interest_num, seq_len,
                        partition_groups=args.partition_groups,
                        lambda_coef=args.dlambda,
                        num_negatives=args.num_negatives,
                        hard_neg_candidates=args.hard_neg_candidates,
-                       add_pos=args.add_pos == 1,  # [P1_FIX] Enable positional encoding
+                       add_pos=False,
                        beta=args.rbeta,
-                       dropout=args.dropout,  # [P1_FIX] Dropout regularization
-                       temperature=getattr(args, 'temperature', 0.1),  # [P1_FIX] Configurable temperature
-                       use_layer_norm=getattr(args, 'use_layer_norm', 1) == 1,  # [P1_FIX] LayerNorm
                        args=args,
                        device=device)
     elif model_type == "DASD-DisMIR":
@@ -290,11 +286,8 @@ def get_model(dataset, model_type, item_count, batch_size, hidden_size, interest
                               lambda_coef=args.dlambda,
                               num_negatives=args.num_negatives,
                               hard_neg_candidates=args.hard_neg_candidates,
-                              add_pos=args.add_pos == 1,
+                              add_pos=False,
                               beta=args.rbeta,
-                              dropout=args.dropout,
-                              temperature=getattr(args, 'temperature', 0.1),
-                              use_layer_norm=getattr(args, 'use_layer_norm', 1) == 1,
                               args=args,
                               device=device)
         # Wrap with DASD_DisMIR for knowledge distillation

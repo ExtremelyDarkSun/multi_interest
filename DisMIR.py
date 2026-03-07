@@ -14,24 +14,14 @@ class CapsuleMultiInterest(nn.Module):
 
     Uses identity transformation matrix (LightGCN-inspired).
     One-time routing instead of 3 iterations for efficiency (as mentioned in paper Sec 5.1.4).
-
-    [P1_FIX] Added LayerNorm for training stability
     """
 
-    def __init__(self, hidden_size, seq_len, interest_num=4, routing_times=1, use_layer_norm=True, dropout=0.0):
+    def __init__(self, hidden_size, seq_len, interest_num=4, routing_times=1):
         super(CapsuleMultiInterest, self).__init__()
         self.hidden_size = hidden_size
         self.seq_len = seq_len
         self.interest_num = interest_num
         self.routing_times = routing_times
-
-        # [P1_FIX] LayerNorm for stable training
-        self.use_layer_norm = use_layer_norm
-        if use_layer_norm:
-            self.layer_norm = nn.LayerNorm(hidden_size)
-
-        # [P1_FIX] Dropout for regularization
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else None
 
     def forward(self, item_eb, mask):
         """
@@ -71,10 +61,6 @@ class CapsuleMultiInterest(nn.Module):
             scalar_factor = cap_norm / (1 + cap_norm) / torch.sqrt(cap_norm + 1e-9)
             interest_capsule = scalar_factor * interest_capsule
 
-            # [P1_FIX] Apply LayerNorm for training stability
-            if self.use_layer_norm:
-                interest_capsule = self.layer_norm(interest_capsule.squeeze(2)).unsqueeze(2)
-
             # Update routing weights if not last iteration
             if i < self.routing_times - 1:
                 delta_weight = torch.matmul(item_eb.unsqueeze(1),
@@ -85,11 +71,6 @@ class CapsuleMultiInterest(nn.Module):
 
         interest_capsule = torch.reshape(interest_capsule,
                                          (-1, self.interest_num, self.hidden_size))
-
-        # [P1_FIX] Apply dropout to interest capsules
-        if self.dropout is not None:
-            interest_capsule = self.dropout(interest_capsule)
-
         return interest_capsule
 
 
@@ -104,19 +85,12 @@ class DisMIR(BasicModel):
     2. Item partition loss with confidence graph sampling
     3. BPR loss with hard negative mining
     4. Shared representation constraint: hidden_size = partition_groups = K
-
-    [P1_FIX] Added:
-    - LayerNorm for training stability
-    - Positional encoding support
-    - Configurable temperature for contrastive learning
-    - Dropout regularization
-    - Attention scaling factor
     """
 
     def __init__(self, item_num, hidden_size, batch_size, interest_num=4,
                  seq_len=20, partition_groups=64, lambda_coef=0.1,
                  num_negatives=100, hard_neg_candidates=10, add_pos=False, beta=0,
-                 dropout=0.0, temperature=0.1, use_layer_norm=True, args=None, device=None):
+                 args=None, device=None):
         """
         [PAPER_REF] Section 5.1.4: hidden_size = partition_groups = 64
 
@@ -130,11 +104,8 @@ class DisMIR(BasicModel):
             lambda_coef: Trade-off coefficient λ for partition loss
             num_negatives: Number of negative samples for partition loss (N_v=100)
             hard_neg_candidates: Number of candidates for hard negative mining (default 10 per paper)
-            add_pos: Whether to add positional encoding
+            add_pos: Whether to add positional encoding (not used in DisMIR)
             beta: IHN temperature parameter
-            dropout: Dropout rate for regularization [P1_FIX]
-            temperature: Temperature for contrastive learning [P1_FIX]
-            use_layer_norm: Whether to use LayerNorm [P1_FIX]
             args: Additional arguments
             device: Computation device
         """
@@ -154,46 +125,16 @@ class DisMIR(BasicModel):
         self.hard_readout = True
         self.device = device
 
-        # [P1_FIX] Temperature for contrastive learning (partition loss)
-        self.temperature = temperature
-
-        # [P1_FIX] Positional encoding
-        self.add_pos = add_pos
-        if add_pos:
-            # Learnable positional embeddings
-            self.pos_embeddings = nn.Embedding(seq_len, hidden_size)
-            nn.init.xavier_uniform_(self.pos_embeddings.weight)
-
-        # [P1_FIX] Dropout for regularization
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else None
-        self.dropout_rate = dropout
-
         # Confidence matrix for item-item relationships
         self.confidence_matrix = None
         self._conf_matrix_coo = None  # COO format for sampling
 
         # Capsule network for multi-interest extraction
         self.capsule_net = CapsuleMultiInterest(
-            hidden_size, seq_len, interest_num, routing_times=1,
-            use_layer_norm=use_layer_norm, dropout=dropout
+            hidden_size, seq_len, interest_num, routing_times=1
         )
 
-        # [P1_FIX] Attention scaling factor (sqrt(d_k) for stable softmax)
-        self.attention_scale = np.sqrt(hidden_size)
-
         self.reset_parameters()
-
-    def reset_parameters(self):
-        """
-        [P1_FIX] Xavier initialization for stable training
-        """
-        # Parent class handles embeddings initialization
-        # Additional initializations if needed
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
 
     def load_confidence_matrix(self, dataset_name, data_path='./data/'):
         """
@@ -337,8 +278,7 @@ class DisMIR(BasicModel):
         ).squeeze(1)  # (B*L, N)
 
         # Temperature-scaled InfoNCE loss with numerical stability
-        # [P1_FIX] Use configurable temperature instead of hard-coded 0.1
-        temperature = self.temperature
+        temperature = 0.1
         # Clamp similarities to prevent overflow in exp
         pos_sim = torch.clamp(pos_sim / temperature, min=-10, max=10)
         neg_sim = torch.clamp(neg_sim / temperature, min=-10, max=10)
@@ -435,17 +375,6 @@ class DisMIR(BasicModel):
         # Item embedding lookup
         item_eb = self.embeddings(item_list)  # (B, L, D)
         item_eb = item_eb * torch.reshape(mask, (-1, self.seq_len, 1))
-
-        # [P1_FIX] Add positional encoding if enabled
-        if self.add_pos:
-            batch_size = item_list.shape[0]
-            positions = torch.arange(self.seq_len, device=item_list.device).unsqueeze(0).expand(batch_size, -1)
-            pos_eb = self.pos_embeddings(positions)  # (B, L, D)
-            item_eb = item_eb + pos_eb
-
-        # [P1_FIX] Apply dropout to item embeddings
-        if self.dropout is not None:
-            item_eb = self.dropout(item_eb)
 
         if train:
             label_eb = self.embeddings(label_list)  # (B, D)
