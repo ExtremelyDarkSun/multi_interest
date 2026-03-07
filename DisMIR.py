@@ -133,8 +133,21 @@ class DisMIR(BasicModel):
         self.capsule_net = CapsuleMultiInterest(
             hidden_size, seq_len, interest_num, routing_times=1
         )
-
+        self.dropout=nn.Dropout(0.2)
+        self.RMS_norm = nn.RMSNorm(hidden_size) 
         self.reset_parameters()
+
+    def reset_parameters(self):
+        """
+        Xavier initialization for stable training
+        """
+        # Parent class handles embeddings initialization
+        # Additional initializations if needed
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def load_confidence_matrix(self, dataset_name, data_path='./data/'):
         """
@@ -374,6 +387,8 @@ class DisMIR(BasicModel):
         """
         # Item embedding lookup
         item_eb = self.embeddings(item_list)  # (B, L, D)
+        item_eb = self.dropout(item_eb)
+        item_eb = self.RMS_norm(item_eb)
         item_eb = item_eb * torch.reshape(mask, (-1, self.seq_len, 1))
 
         if train:
