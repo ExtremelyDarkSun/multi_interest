@@ -5,6 +5,16 @@ import numpy as np
 from scipy import sparse
 from BasicModel import BasicModel
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        # 计算均方根
+        norm = x.norm(2, dim=-1, keepdim=True) / (x.shape[-1] ** 0.5)
+        return self.weight * x / (norm + self.eps)
 
 class CapsuleMultiInterest(nn.Module):
     """
@@ -134,7 +144,7 @@ class DisMIR(BasicModel):
             hidden_size, seq_len, interest_num, routing_times=1
         )
         self.dropout=nn.Dropout(0.2)
-        self.RMS_norm = nn.RMSNorm(hidden_size) 
+        self.RMS_norm = RMSNorm(hidden_size) 
         self.reset_parameters()
 
     def reset_parameters(self):
