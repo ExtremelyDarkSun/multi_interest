@@ -397,8 +397,6 @@ class DisMIR(BasicModel):
         """
         # Item embedding lookup
         item_eb = self.embeddings(item_list)  # (B, L, D)
-        item_eb = self.dropout(item_eb)
-        item_eb = self.RMS_norm(item_eb)
         item_eb = item_eb * torch.reshape(mask, (-1, self.seq_len, 1))
 
         if train:

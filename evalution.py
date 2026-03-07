@@ -302,13 +302,7 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
                 # Optional: Routing regularization
                 if args.rlambda > 0:
                     loss = loss + args.rlambda * model.calculate_atten_loss(atten)
-            else:
-                loss = model.calculate_sampled_loss(readout, pos_items, selection, interests) if model.is_sampler else model.calculate_full_loss(loss_fn, scores, to_tensor(targets, device), interests)
-
-            if model_type == "REMI":
-                loss += args.rlambda * model.calculate_atten_loss(atten)
-
-            if model_type == "DASD-DisMIR":
+            elif model_type == "DASD-DisMIR":
                 # [DASD-DisMIR] Knowledge Distillation with DisMIR
                 # Returns (interests, total_loss, loss_dict) in training mode
                 interests, total_loss, loss_dict = model(
@@ -320,6 +314,11 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
                     print(f"[DASD-DisMIR Loss Details] main: {loss_dict['main_loss']:.4f}, "
                           f"recon: {loss_dict['recon_loss']:.4f}, align: {loss_dict['align_loss']:.4f}, "
                           f"infonce: {loss_dict['infonce_loss']:.4f}, partition: {loss_dict['partition_loss']:.4f}")
+            else:
+                loss = model.calculate_sampled_loss(readout, pos_items, selection, interests) if model.is_sampler else model.calculate_full_loss(loss_fn, scores, to_tensor(targets, device), interests)
+
+            if model_type == "REMI":
+                loss += args.rlambda * model.calculate_atten_loss(atten)
 
             loss.backward()
 
