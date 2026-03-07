@@ -322,10 +322,6 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
 
             loss.backward()
 
-            # [DisMIR/DASD-DisMIR] Gradient clipping to prevent NaN
-            if model_type in ["DisMIR", "DASD-DisMIR"]:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-
             optimizer.step()
 
             total_loss += loss
