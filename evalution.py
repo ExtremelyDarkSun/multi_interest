@@ -240,8 +240,11 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
     model.loss_fct = loss_fn
     try:
         total_loss, total_loss_1, total_loss_2, total_loss_3, total_loss_4, total_loss_5  = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        # Loss accumulators for detailed logging
+        loss_accumulators = {}
         iter = 0
         best_metric = 0 # 最佳指标值，在这里是最佳recall值
+        loss_print_interval = getattr(args, 'loss_print_interval', 100)
         #scheduler.step()
         for i, (users, targets, items, mask, times) in enumerate(train_data):
             model.train()
@@ -288,6 +291,9 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
 
                 loss = bpr_loss
 
+                # Initialize loss dict for detailed logging
+                iter_loss_dict = {'bpr_loss': bpr_loss.item()}
+
                 # Item partition loss
                 if args.dlambda > 0:
                     partition_loss = model.compute_partition_loss(
@@ -296,12 +302,30 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
                     )
                     if not torch.isnan(partition_loss):
                         loss = loss + args.dlambda * partition_loss
+                        iter_loss_dict['partition_loss'] = partition_loss.item()
                     else:
                         print(f"[DisMIR Warning] partition_loss is NaN at iter {iter}, skipping")
+                        iter_loss_dict['partition_loss'] = 0.0
 
                 # Optional: Routing regularization
                 if args.rlambda > 0:
-                    loss = loss + args.rlambda * model.calculate_atten_loss(atten)
+                    atten_loss = model.calculate_atten_loss(atten)
+                    loss = loss + args.rlambda * atten_loss
+                    iter_loss_dict['atten_loss'] = atten_loss.item()
+
+                # Accumulate losses for detailed logging
+                for key, val in iter_loss_dict.items():
+                    if key not in loss_accumulators:
+                        loss_accumulators[key] = 0.0
+                    loss_accumulators[key] += val
+
+                # Print detailed losses at intervals
+                if iter % loss_print_interval == 0 and iter > 0:
+                    loss_detail_str = ', '.join([f"{k}: {v/loss_print_interval:.4f}" for k, v in loss_accumulators.items()])
+                    print(f"[DisMIR Loss Details @ iter {iter}] {loss_detail_str}")
+                    # Reset accumulators
+                    loss_accumulators = {}
+
             elif model_type == "DASD-DisMIR":
                 # [DASD-DisMIR] Knowledge Distillation with DisMIR
                 # Returns (interests, total_loss, loss_dict) in training mode
@@ -309,11 +333,24 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
                     to_tensor(items, device), pos_items, to_tensor(mask, device), times_tensor, device, train=True
                 )
                 loss = total_loss
-                # Optionally print detailed losses every N iterations
-                if iter % test_iter == 0 and iter > 0:
-                    print(f"[DASD-DisMIR Loss Details] main: {loss_dict['main_loss']:.4f}, "
-                          f"recon: {loss_dict['recon_loss']:.4f}, align: {loss_dict['align_loss']:.4f}, "
-                          f"infonce: {loss_dict['infonce_loss']:.4f}, partition: {loss_dict['partition_loss']:.4f}")
+
+                # Accumulate losses for detailed logging
+                for key, val in loss_dict.items():
+                    if key not in loss_accumulators:
+                        loss_accumulators[key] = 0.0
+                    loss_accumulators[key] += val
+
+                # Print detailed losses at intervals
+                if iter % loss_print_interval == 0 and iter > 0:
+                    avg_losses = {k: v/loss_print_interval for k, v in loss_accumulators.items()}
+                    print(f"[DASD-DisMIR Loss Details @ iter {iter}] "
+                          f"main: {avg_losses.get('main_loss', 0):.4f}, "
+                          f"recon: {avg_losses.get('recon_loss', 0):.4f}, "
+                          f"align: {avg_losses.get('align_loss', 0):.4f}, "
+                          f"infonce: {avg_losses.get('infonce_loss', 0):.4f}, "
+                          f"partition: {avg_losses.get('partition_loss', 0):.4f}")
+                    # Reset accumulators
+                    loss_accumulators = {}
             else:
                 loss = model.calculate_sampled_loss(readout, pos_items, selection, interests) if model.is_sampler else model.calculate_full_loss(loss_fn, scores, to_tensor(targets, device), interests)
 

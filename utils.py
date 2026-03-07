@@ -29,6 +29,7 @@ def get_parser():
     parser.add_argument('--lr_dc', type=float, default=0.1, help='learning rate decay rate')
     parser.add_argument('--lr_dc_step', type=int, default=30, help='(k), the number of steps after which the learning rate decay')
     parser.add_argument('--max_iter', type=int, default=1000, help='(k)') # 最大迭代次数，单位是k（1000）
+    parser.add_argument('--loss_print_interval', type=int, default=100, help='print detailed loss every N iterations')
     parser.add_argument('--patience', type=int, default=50) # patience，用于early stopping
     parser.add_argument('--topN', type=int, default=50) # default=50
     parser.add_argument('--gpu', type=str, default=None) # None -> cpu
