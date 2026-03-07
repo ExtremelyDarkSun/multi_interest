@@ -57,6 +57,12 @@ def get_parser():
     parser.add_argument('--hard_neg_candidates', type=int, default=10,
                         help='[DisMIR] Number of candidates for hard negative mining [PAPER_REF] default 10')
 
+    # [Overlapped Partition] Soft partition assignment [PAPER_REF] Sec 4.1.2
+    parser.add_argument('--use_overlapped_partition', type=int, default=0,
+                        help='[DisMIR] Use overlapped partition (0/1) [PAPER_REF] Sec 4.1.2, default 0 (non-overlapped)')
+    parser.add_argument('--partition_temperature', type=float, default=1.0,
+                        help='[DisMIR] Temperature for softmax in overlapped partition, default 1.0')
+
     # [P1_FIX] Additional hyperparameters for DisMIR training stability
     parser.add_argument('--temperature', type=float, default=0.1,
                         help='[DisMIR] Temperature for contrastive learning in partition loss [P1_FIX] default 0.1')
@@ -275,6 +281,8 @@ def get_model(dataset, model_type, item_count, batch_size, hidden_size, interest
                        hard_neg_candidates=args.hard_neg_candidates,
                        add_pos=False,
                        beta=args.rbeta,
+                       use_overlapped_partition=getattr(args, 'use_overlapped_partition', 0) == 1,
+                       partition_temperature=getattr(args, 'partition_temperature', 1.0),
                        args=args,
                        device=device)
     elif model_type == "DASD-DisMIR":
@@ -288,6 +296,8 @@ def get_model(dataset, model_type, item_count, batch_size, hidden_size, interest
                               hard_neg_candidates=args.hard_neg_candidates,
                               add_pos=False,
                               beta=args.rbeta,
+                              use_overlapped_partition=getattr(args, 'use_overlapped_partition', 0) == 1,
+                              partition_temperature=getattr(args, 'partition_temperature', 1.0),
                               args=args,
                               device=device)
         # Wrap with DASD_DisMIR for knowledge distillation
