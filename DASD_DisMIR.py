@@ -57,7 +57,82 @@ class ChamferLoss(nn.Module):
         return total_loss
 
 
-# ============ 2. TargetAwareFusion ============
+# ============ 2. Partition Enhancer ============
+
+class PartitionEnhancer(nn.Module):
+    """
+    Partition 增强模块
+    使用 temperature-scaled softmax 突出 item 的主要分区特征
+    物理含义：将 embedding 转化为相对概率分布，突出主要分区，压制次要分区
+    """
+    def __init__(self, hidden_size, temperature=0.5):
+        super(PartitionEnhancer, self).__init__()
+        self.hidden_size = hidden_size
+        self.temperature = temperature  # < 1 使分布更尖锐
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, L, D) 或 (B, D) - 原始 item embedding
+        Returns:
+            enhanced: 相同 shape - partition 增强后的 embedding
+        """
+        # Temperature-scaled softmax: 突出主要分区，压制次要分区
+        # dim=-1 表示在 hidden_size 维度上做 softmax
+        partition_weights = F.softmax(x / self.temperature, dim=-1)
+
+        # 原始特征加权：高激活维度保留，低激活维度被压制
+        enhanced = x * partition_weights
+
+        return enhanced
+
+
+# ============ 3. Partition Aligned Loss ============
+
+class PartitionAlignedLoss(nn.Module):
+    """
+    Token 与 Interest 的 Partition 结构对齐损失
+    强制 Teacher 的 Tokens 和 Student 的 Interests 在相同的 Partition 维度上激活
+
+    与 ChamferLoss 的区别：
+    - ChamferLoss: 原始 embedding 空间的 L2 距离（几何对齐）
+    - PartitionAlignedLoss: Softmax 后的 partition 空间的相似度（语义结构对齐）
+    """
+    def __init__(self, hidden_size, temperature=1.0):
+        super(PartitionAlignedLoss, self).__init__()
+        self.hidden_size = hidden_size
+        self.temperature = temperature
+
+    def forward(self, tokens, interests):
+        """
+        Args:
+            tokens: (B, K, D) - Teacher 生成的 tokens
+            interests: (B, M, D) - Student 生成的 interests
+        Returns:
+            loss: scalar - partition 对齐损失（负值，需要最小化）
+        """
+        # 1. 提取 Partition 分布（在 hidden_size 维度 softmax）
+        # 每个 token/interest 在各 partition 维度上的激活分布
+        token_parts = F.softmax(tokens / self.temperature, dim=-1)      # (B, K, D)
+        interest_parts = F.softmax(interests / self.temperature, dim=-1)  # (B, M, D)
+
+        # 2. 计算每个 token 与每个 interest 的 partition 相似度
+        # (B, K, D) @ (B, D, M) -> (B, K, M)
+        part_sim = torch.matmul(token_parts, interest_parts.transpose(1, 2))
+
+        # 3. 双向最佳匹配
+        # 每个 token 找最相似的 interest
+        best_for_token = part_sim.max(dim=2)[0].mean()  # (B, K) -> scalar
+        # 每个 interest 找最相似的 token
+        best_for_interest = part_sim.max(dim=1)[0].mean()  # (B, M) -> scalar
+
+        # 4. 最大化相似度（即最小化负相似度）
+        loss = -(best_for_token + best_for_interest) / 2
+
+        return loss
+
+
+# ============ 4. TargetAwareFusion ============
 
 class TargetAwareFusion(nn.Module):
     """
@@ -590,6 +665,17 @@ class DASD_DisMIR(nn.Module):
         # Loss模块
         self.chamfer_loss = ChamferLoss()
 
+        # Partition-aware 模块
+        self.partition_enhancer = PartitionEnhancer(
+            hidden_size=hidden_size,
+            temperature=getattr(args, 'partition_temperature', 0.5)
+        )
+        self.partition_align_loss = PartitionAlignedLoss(
+            hidden_size=hidden_size,
+            temperature=getattr(args, 'partition_align_temperature', 1.0)
+        )
+        self.lambda_partition_align = getattr(args, 'lambda_partition_align', 0.3)
+
     def forward(self, item_list, label_list, mask, times, device, train=True):
         """
         前向传播
@@ -630,8 +716,11 @@ class DASD_DisMIR(nn.Module):
         # 应用mask
         history_eb = history_eb * mask.unsqueeze(-1)  # (batch_size, seq_len, hidden_size)
 
-        # Tokenizer生成tokens和重构target
-        tokens, recon_target = self.tokenizer(label_eb, history_eb, mask)
+        # 【Partition 增强】对 history 进行 partition-aware 增强
+        history_enhanced = self.partition_enhancer(history_eb)
+
+        # Tokenizer生成tokens和重构target（使用增强后的 history）
+        tokens, recon_target = self.tokenizer(label_eb, history_enhanced, mask)
 
         # 3. Target-Aware Fusion
         # 将M个兴趣向量融合为单个向量
@@ -653,6 +742,10 @@ class DASD_DisMIR(nn.Module):
         # Teacher和Student独立训练，只通过Loss进行知识蒸馏
         align_loss = self.chamfer_loss(tokens, interests)
 
+        # 4.3b Partition 结构对齐损失
+        # 强制 Token 和 Interest 在相同的 partition 维度上激活
+        partition_align_loss = self.partition_align_loss(tokens, interests)
+
         # 4.4 InfoNCE Loss
         # 拉近同一target的tokens和对应label_emb的距离，拉远与batch内其他label_emb的距离
         infonce_loss = self.calculate_infonce_loss(tokens, label_eb, temperature=0.07)
@@ -667,11 +760,13 @@ class DASD_DisMIR(nn.Module):
 
         # 5. 总Loss组合公式
         # total_loss = main_loss + lambda_recon * recon_loss + lambda_align * align_loss
+        #              + lambda_partition_align * partition_align_loss
         #              + lambda_infonce * infonce_loss + partition_loss + rlambda * atten_loss
         total_loss = (
             main_loss +
             self.lambda_recon * recon_loss +
             self.lambda_align * align_loss +
+            self.lambda_partition_align * partition_align_loss +
             self.lambda_infonce * infonce_loss +
             self.dismir.lambda_coef * partition_loss +
             self.rlambda * atten_loss
@@ -682,6 +777,7 @@ class DASD_DisMIR(nn.Module):
             'main_loss': main_loss.item() if isinstance(main_loss, torch.Tensor) else main_loss,
             'recon_loss': recon_loss.item() if isinstance(recon_loss, torch.Tensor) else recon_loss,
             'align_loss': align_loss.item() if isinstance(align_loss, torch.Tensor) else align_loss,
+            'partition_align_loss': partition_align_loss.item() if isinstance(partition_align_loss, torch.Tensor) else partition_align_loss,
             'infonce_loss': infonce_loss.item() if isinstance(infonce_loss, torch.Tensor) else infonce_loss,
             'partition_loss': partition_loss.item() if isinstance(partition_loss, torch.Tensor) else partition_loss,
             'atten_loss': atten_loss.item() if isinstance(atten_loss, torch.Tensor) else atten_loss,

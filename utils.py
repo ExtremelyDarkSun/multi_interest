@@ -78,6 +78,14 @@ def get_parser():
     parser.add_argument('--lambda_infonce', type=float, default=0.1,
                         help='[DASD-DisMIR] InfoNCE contrastive loss weight [DASD_REF] default 0.1')
 
+    # [Partition-Aware DASD-DisMIR] Partition enhancement hyperparameters
+    parser.add_argument('--lambda_partition_align', type=float, default=0.3,
+                        help='[Partition-Aware DASD-DisMIR] Partition alignment loss weight, default 0.3')
+    parser.add_argument('--partition_temperature', type=float, default=0.5,
+                        help='[Partition-Aware DASD-DisMIR] Temperature for partition enhancement (<1 for sharper), default 0.5')
+    parser.add_argument('--partition_align_temperature', type=float, default=1.0,
+                        help='[Partition-Aware DASD-DisMIR] Temperature for partition alignment, default 1.0')
+
     return parser
 
 
