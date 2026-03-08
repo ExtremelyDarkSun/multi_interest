@@ -323,7 +323,7 @@ class DisMIR(BasicModel):
 
         return loss
 
-    def compute_bpr_loss_with_hard_negative(self, user_eb, pos_items, neg_candidates=10):
+    def compute_bpr_loss_with_hard_negative(self, user_eb, pos_items, neg_candidates=1280):
         """
         Compute BPR loss with hard negative mining + shared negatives (REMI-style)
         [PAPER_REF] Section 4.3: "We adopt the BPR loss with hard negative mining"
