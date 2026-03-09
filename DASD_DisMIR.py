@@ -670,6 +670,7 @@ class DASD_DisMIR(nn.Module):
             hidden_size=hidden_size,
             temperature=getattr(args, 'partition_temperature', 0.5)
         )
+        self.partition_enhancer_norm = nn.LayerNorm(hidden_size)  # 添加 LayerNorm
         self.partition_align_loss = PartitionAlignedLoss(
             hidden_size=hidden_size,
             temperature=getattr(args, 'partition_align_temperature', 1.0)
@@ -716,8 +717,9 @@ class DASD_DisMIR(nn.Module):
         # 应用mask
         history_eb = history_eb * mask.unsqueeze(-1)  # (batch_size, seq_len, hidden_size)
 
-        # 【Partition 增强】对 history 进行 partition-aware 增强
-        history_enhanced = self.partition_enhancer(history_eb)
+        # 【Partition 增强】对 history 进行 partition-aware 增强（带残差连接和LayerNorm）
+        history_residual = self.partition_enhancer(history_eb)
+        history_enhanced = self.partition_enhancer_norm(history_eb + history_residual)
 
         # Tokenizer生成tokens和重构target（使用增强后的 history）
         tokens, recon_target = self.tokenizer(label_eb, history_enhanced, mask)
