@@ -598,8 +598,8 @@ class ContextGatedTokenizer(nn.Module):
 
 
 # ============ 4. DASD_DisMIR 主类 ============
-
-class DASD_DisMIR(nn.Module):
+from BasicModel import BasicModel
+class DASD_DisMIR(BasicModel):
     """
     DASD-DisMIR 完整封装模型
 
@@ -676,7 +676,7 @@ class DASD_DisMIR(nn.Module):
             temperature=getattr(args, 'partition_align_temperature', 1.0)
         )
         self.lambda_partition_align = getattr(args, 'lambda_partition_align', 0.3)
-
+        self.reset_parameters()
     def forward(self, item_list, label_list, mask, times, device, train=True):
         """
         前向传播
@@ -753,7 +753,9 @@ class DASD_DisMIR(nn.Module):
         infonce_loss = self.calculate_infonce_loss(tokens, label_eb, temperature=0.07)
 
         # 4.5 DisMIR原有分区损失（Partition Loss）
-        partition_loss = self.dismir.compute_partition_loss(item_list, mask)
+        # 使用确定性种子确保与DisMIR一致
+        deterministic_seed = 42 + item_list.sum().item() % 10000
+        partition_loss = self.dismir.compute_partition_loss(item_list, mask, seed=deterministic_seed)
 
         # 4.6 DisMIR原有路由正则化损失（如果rlambda > 0）
         atten_loss = 0.0

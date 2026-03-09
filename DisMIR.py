@@ -240,7 +240,7 @@ class DisMIR(BasicModel):
 
         return pos_samples
 
-    def compute_partition_loss(self, items, mask):
+    def compute_partition_loss(self, items, mask, seed=None):
         """
         Compute partition loss via contrastive learning
         [PAPER_REF] Theorem 4 and Section 4.2.3
@@ -256,10 +256,15 @@ class DisMIR(BasicModel):
         Args:
             items: (batch_size, seq_len) item ids
             mask: (batch_size, seq_len) padding mask
+            seed: Optional random seed for reproducible sampling
 
         Returns:
             partition_loss: scalar tensor
         """
+        # Set random seeds if provided for reproducibility
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
         batch_size, seq_len = items.shape
 
         # Get item embeddings (B, L, D) where D = K (partition_groups)

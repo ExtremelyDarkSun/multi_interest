@@ -296,9 +296,14 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
 
                 # Item partition loss
                 if args.dlambda > 0:
+                    items_tensor = to_tensor(items, device)
+                    mask_tensor = to_tensor(mask, device)
+                    # 使用确定性种子确保可复现性（与DASD-DisMIR一致）
+                    deterministic_seed = 42 + items_tensor.sum().item() % 10000
                     partition_loss = model.compute_partition_loss(
-                        to_tensor(items, device),
-                        to_tensor(mask, device)
+                        items_tensor,
+                        mask_tensor,
+                        seed=deterministic_seed
                     )
                     if not torch.isnan(partition_loss):
                         loss = loss + args.dlambda * partition_loss
