@@ -421,7 +421,8 @@ class BasicModel(nn.Module):
 
     def reset_parameters(self, initializer=None):
         for weight in self.parameters():
-            torch.nn.init.kaiming_normal_(weight)
+            if weight.dim() >= 2:
+                torch.nn.init.kaiming_normal_(weight)
 
 
     def read_out(self, user_eb, label_eb):
