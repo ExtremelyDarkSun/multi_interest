@@ -627,7 +627,11 @@ class DASD_DisMIR(BasicModel):
                 - interest_num: 兴趣数量
                 - hidden_size: 隐藏层维度
         """
-        super(DASD_DisMIR, self).__init__()
+        super(DASD_DisMIR, self).__init__(
+            dismir_model.item_num,
+            dismir_model.hidden_size,
+            dismir_model.batch_size
+        )
 
         self.dismir = dismir_model  # 原有的DisMIR模型（Student）
 
