@@ -347,6 +347,7 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
                           f"main: {avg_losses.get('main_loss', 0):.4f}, "
                           f"recon: {avg_losses.get('recon_loss', 0):.4f}, "
                           f"align: {avg_losses.get('align_loss', 0):.4f}, "
+                          f"part_align: {avg_losses.get('partition_align_loss', 0):.4f}, "
                           f"infonce: {avg_losses.get('infonce_loss', 0):.4f}, "
                           f"partition: {avg_losses.get('partition_loss', 0):.4f}")
                     # Reset accumulators

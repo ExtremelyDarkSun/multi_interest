@@ -722,9 +722,9 @@ class DASD_DisMIR(nn.Module):
         # Tokenizer生成tokens和重构target（使用增强后的 history）
         tokens, recon_target = self.tokenizer(label_eb, history_enhanced, mask)
 
-        # 3. Target-Aware Fusion
-        # 将M个兴趣向量融合为单个向量
-        fused_pred = self.fusion(interests, label_eb)  # (batch_size, hidden_size)
+        # 3. Target-Aware Fusion (Hard Selection - 与DisMIR一致)
+        # 使用read_out方法选择与target最相关的单个兴趣
+        fused_pred, _ = self.dismir.read_out(interests, label_eb)  # (batch_size, hidden_size)
 
         # 4. 计算所有Loss
 
