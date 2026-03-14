@@ -36,7 +36,7 @@ class ChamferLoss(nn.Module):
         # dist_matrix: (batch_size, K, M)
         # 使用L2距离（p=2）
 
-        tokens = F.normalize(tokens, p=2, dim=-1)  # L2归一化
+        tokens = F.normalize(tokens, p=2, dim=-1).detach()  # L2归一化
         interests = F.normalize(interests, p=2, dim=-1)
 
         dist_matrix = torch.cdist(tokens, interests, p=2)
@@ -754,7 +754,7 @@ class DASD_DisMIR(BasicModel):
 
         # 4.4 InfoNCE Loss
         # 拉近同一target的tokens和对应label_emb的距离，拉远与batch内其他label_emb的距离
-        infonce_loss = self.calculate_infonce_loss(tokens, label_eb, temperature=0.07)
+        infonce_loss = self.calculate_infonce_loss(tokens, label_eb, temperature=0.08)#0.07
 
         # 4.5 DisMIR原有分区损失（Partition Loss）
         # 使用确定性种子确保与DisMIR一致
@@ -836,6 +836,84 @@ class DASD_DisMIR(BasicModel):
         infonce_loss = F.cross_entropy(similarity, labels)
 
         return infonce_loss
+
+    def encode_with_teacher(self, item_list, label_list, mask, device):
+        """
+        使用 Teacher (Tokenizer) 编码用户历史，label 作为 target。
+
+        用于 Pretrain 阶段的评估，生成 interest tokens 用于计算 recall。
+
+        Args:
+            item_list: 历史物品序列 (batch_size, seq_len)
+            label_list: 目标物品 (batch_size,) - 作为 target 输入给 Teacher
+            mask: 序列 mask (batch_size, seq_len)
+            device: 设备
+
+        Returns:
+            tokens: (batch_size, num_tokens, hidden_size) - Teacher 生成的 tokens
+        """
+        # 获取 label 和 history 的 embedding
+        label_eb = self.dismir.embeddings(label_list)  # (batch_size, hidden_size)
+        history_eb = self.dismir.embeddings(item_list)  # (batch_size, seq_len, hidden_size)
+        history_eb = history_eb * mask.unsqueeze(-1)  # (batch_size, seq_len, hidden_size)
+
+        # 应用 partition_enhancer
+        history_residual = self.partition_enhancer(history_eb)
+        history_enhanced = self.partition_enhancer_norm(history_eb + history_residual)
+
+        # 调用 tokenizer 生成 tokens
+        tokens, _ = self.tokenizer(label_eb, history_enhanced, mask)
+
+        return tokens  # (batch_size, num_tokens, hidden_size)
+
+    def forward_teacher_pretrain(self, item_list, label_list, mask, times, device):
+        """
+        Stage-1 Teacher-only forward pass.
+
+        Only the Tokenizer (Teacher) is trained; the Student (DisMIR) is run in
+        no-grad mode so its embeddings are still updated through the shared
+        embedding table, but its routing/capsule parameters receive no gradient.
+
+        Args:
+            item_list:  historical item ids  (batch_size, seq_len)
+            label_list: target item ids      (batch_size,)
+            mask:       sequence mask        (batch_size, seq_len)
+            times:      time info tuple      (time_matrix, adj_matrix)
+            device:     torch device
+
+        Returns:
+            total_loss: scalar tensor (recon + infonce)
+            loss_dict:  per-component loss values
+        """
+        # Shared embedding lookup (gradients flow here)
+        label_eb = self.dismir.embeddings(label_list)       # (B, D)
+        history_eb = self.dismir.embeddings(item_list)      # (B, L, D)
+        history_eb = history_eb * mask.unsqueeze(-1)
+
+        # Partition-aware history enhancement (same as joint training)
+        history_residual = self.partition_enhancer(history_eb)
+        history_enhanced = self.partition_enhancer_norm(history_eb + history_residual)
+
+        # Teacher forward
+        tokens, recon_target = self.tokenizer(label_eb, history_enhanced, mask)
+
+        # Reconstruction loss
+        recon_loss = F.mse_loss(
+            F.normalize(recon_target, dim=-1),
+            F.normalize(label_eb.detach(), dim=-1)
+        )
+
+        # InfoNCE loss (Teacher tokens vs target labels)
+        infonce_loss = self.calculate_infonce_loss(tokens, label_eb, temperature=0.5)
+
+        total_loss = self.lambda_recon * recon_loss + self.lambda_infonce * infonce_loss
+
+        loss_dict = {
+            'recon_loss':   recon_loss.item(),
+            'infonce_loss': infonce_loss.item(),
+            'total_loss':   total_loss.item(),
+        }
+        return total_loss, loss_dict
 
     # ============ 兼容DisMIR接口的方法 ============
 

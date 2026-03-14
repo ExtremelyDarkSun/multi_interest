@@ -8,7 +8,7 @@ print('pid:%d' % (pid))
 
 import torch
 from utils import get_parser, setup_seed
-from evalution import train, test, output
+from evalution import train, test, output, train_teacher_pretrain
 
 
 if __name__ == '__main__':
@@ -134,11 +134,29 @@ if __name__ == '__main__':
 
 
     if args.p == 'train':
-        train(device=device, train_file=train_file, valid_file=valid_file, test_file=test_file, 
-                dataset=dataset, model_type=args.model_type, item_count=item_count, batch_size=batch_size,
-                lr=args.learning_rate, seq_len=seq_len, hidden_size=args.hidden_size, 
-                interest_num=args.interest_num, topN=args.topN, max_iter=args.max_iter, test_iter=test_iter, 
-                decay_step=args.lr_dc_step, lr_decay=args.lr_dc, patience=args.patience, exp=args.exp, args=args)
+        pretrain_stage = getattr(args, 'pretrain', 0)
+
+        if pretrain_stage == 1:
+            # Stage 1: pretrain Teacher only
+            train_teacher_pretrain(
+                device=device, train_file=train_file, valid_file=valid_file,
+                dataset=dataset, model_type=args.model_type,
+                item_count=item_count, batch_size=batch_size,
+                lr=args.learning_rate, seq_len=seq_len,
+                hidden_size=args.hidden_size, interest_num=args.interest_num,
+                topN=args.topN, max_iter=args.max_iter, test_iter=test_iter,
+                decay_step=args.lr_dc_step, lr_decay=args.lr_dc,
+                patience=args.patience, exp=args.exp, args=args)
+        else:
+            # Stage 0 (default joint training) or Stage 2 (load Teacher then joint)
+            train(device=device, train_file=train_file, valid_file=valid_file,
+                  test_file=test_file, dataset=dataset,
+                  model_type=args.model_type, item_count=item_count,
+                  batch_size=batch_size, lr=args.learning_rate, seq_len=seq_len,
+                  hidden_size=args.hidden_size, interest_num=args.interest_num,
+                  topN=args.topN, max_iter=args.max_iter, test_iter=test_iter,
+                  decay_step=args.lr_dc_step, lr_decay=args.lr_dc,
+                  patience=args.patience, exp=args.exp, args=args)
     elif args.p == 'test':
         test(device=device, test_file=test_file, cate_file=cate_file, dataset=dataset, model_type=args.model_type, 
                 item_count=item_count, batch_size=batch_size, lr=args.learning_rate, seq_len=seq_len, 

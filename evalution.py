@@ -228,6 +228,12 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
 
     model.set_sampler(args, device=device)
 
+    # [Stage-2] Load pretrained Teacher weights before joint training
+    if model_type == "DASD-DisMIR" and getattr(args, 'pretrain', 0) == 2:
+        teacher_model_path = "best_model/" + exp_name + "_teacher/"
+        load_teacher_weights(model, teacher_model_path)
+        print("[Pretrain Stage-2] Teacher weights loaded; proceeding with joint training")
+
     loss_fn = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr = lr, weight_decay=args.weight_decay)
 
@@ -448,7 +454,254 @@ def test(device, test_file, cate_file, dataset, model_type, item_count, batch_si
     print(', '.join(['test ' + key + ': %.6f' % value for key, value in metrics.items()]))
 
 
-def output(device, dataset, model_type, item_count, batch_size, lr, seq_len, 
+def save_teacher_weights(model, teacher_model_path):
+    """Save only the Tokenizer (Teacher) weights + shared embeddings."""
+    if not os.path.exists(teacher_model_path):
+        os.makedirs(teacher_model_path)
+    state = {
+        'tokenizer': model.tokenizer.state_dict(),
+        'partition_enhancer': model.partition_enhancer.state_dict(),
+        'partition_enhancer_norm': model.partition_enhancer_norm.state_dict(),
+        'embeddings': model.dismir.embeddings.state_dict(),
+    }
+    torch.save(state, teacher_model_path + 'teacher.pt')
+    print(f'Teacher weights saved to {teacher_model_path}teacher.pt')
+
+
+def load_teacher_weights(model, teacher_model_path):
+    """Load Tokenizer (Teacher) weights + shared embeddings into model."""
+    path = teacher_model_path + 'teacher.pt'
+    state = torch.load(path, map_location='cpu')
+    model.tokenizer.load_state_dict(state['tokenizer'])
+    model.partition_enhancer.load_state_dict(state['partition_enhancer'])
+    model.partition_enhancer_norm.load_state_dict(state['partition_enhancer_norm'])
+    model.dismir.embeddings.load_state_dict(state['embeddings'])
+    print(f'Teacher weights loaded from {path}')
+
+
+def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
+                           item_count, batch_size, lr, seq_len, hidden_size,
+                           interest_num, topN, max_iter, test_iter, decay_step,
+                           lr_decay, patience, exp, args):
+    """
+    Stage-1: Pretrain only the Teacher (Tokenizer) of DASD-DisMIR.
+
+    Optimises recon_loss + infonce_loss from forward_teacher_pretrain().
+    Saves the LATEST checkpoint (not best) to best_model/{exp_name}_teacher_{timestamp}/.
+    """
+    from utils import get_exp_name, get_DataLoader, get_model, save_model, to_tensor
+    from datetime import datetime
+
+    print("[Pretrain Stage-1] Teacher-only pretraining")
+    exp_name = get_exp_name(dataset, model_type, batch_size, lr, hidden_size,
+                            seq_len, interest_num, topN, exp=exp)
+    # Add timestamp suffix to folder name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    teacher_model_path = "best_model/" + exp_name + "_teacher_" + timestamp + "/"
+
+    train_data = get_DataLoader(train_file, batch_size, seq_len, train_flag=1, args=args)
+    valid_data = get_DataLoader(valid_file, batch_size, seq_len, train_flag=0, args=args)
+
+    model = get_model(dataset, model_type, item_count, batch_size, hidden_size,
+                      interest_num, seq_len, args=args, device=device)
+    model = model.to(device)
+    model.set_device(device)
+    model.load_confidence_matrix(dataset, data_path='./data/')
+    model.set_sampler(args, device=device)
+
+    # Only optimise Teacher-related parameters (+ shared embeddings)
+    teacher_params = (
+        list(model.tokenizer.parameters()) +
+        list(model.partition_enhancer.parameters()) +
+        list(model.partition_enhancer_norm.parameters()) +
+        list(model.dismir.embeddings.parameters())
+    )
+    optimizer = torch.optim.Adam(teacher_params, lr=lr,
+                                 weight_decay=args.weight_decay)
+
+    trials = 0
+    best_val_loss = float('inf')
+    loss_print_interval = getattr(args, 'loss_print_interval', 100)
+    loss_accumulators = {}
+    start_time = time.time()
+
+    print('[Pretrain Stage-1] training begin')
+    sys.stdout.flush()
+
+    try:
+        iter_count = 0
+        for i, (users, targets, items, mask, times) in enumerate(train_data):
+            model.train()
+            iter_count += 1
+            optimizer.zero_grad()
+
+            pos_items = to_tensor(targets, device)
+            time_mat, adj_mat = times
+            times_tensor = (to_tensor(time_mat, device), to_tensor(adj_mat, device))
+
+            total_loss, loss_dict = model.forward_teacher_pretrain(
+                to_tensor(items, device), pos_items,
+                to_tensor(mask, device), times_tensor, device
+            )
+            total_loss.backward()
+            optimizer.step()
+
+            # Accumulate for periodic printing
+            for key, val in loss_dict.items():
+                loss_accumulators[key] = loss_accumulators.get(key, 0.0) + val
+
+            if iter_count % loss_print_interval == 0:
+                avg = {k: v / loss_print_interval for k, v in loss_accumulators.items()}
+                print(f"[Pretrain-Teacher @ iter {iter_count}] "
+                      f"recon: {avg.get('recon_loss', 0):.4f}, "
+                      f"infonce: {avg.get('infonce_loss', 0):.4f}, "
+                      f"total: {avg.get('total_loss', 0):.4f}")
+                loss_accumulators = {}
+
+            if iter_count % test_iter == 0:
+                # Validation: measure all losses on valid set
+                model.eval()
+                val_accumulators = {}
+                val_count = 0
+                with torch.no_grad():
+                    for _, (v_users, v_targets, v_items, v_mask, v_times) in enumerate(valid_data):
+                        # In eval mode, v_targets is a list of lists (per-user test items).
+                        # Take the first item of each user's target list to match training format.
+                        v_targets_flat = [t[0] if isinstance(t, (list, tuple)) else t for t in v_targets]
+                        v_pos = to_tensor(v_targets_flat, device)
+                        v_tm, v_am = v_times
+                        v_times_t = (to_tensor(v_tm, device), to_tensor(v_am, device))
+                        _, v_loss_dict = model.forward_teacher_pretrain(
+                            to_tensor(v_items, device), v_pos,
+                            to_tensor(v_mask, device), v_times_t, device
+                        )
+                        for key, val in v_loss_dict.items():
+                            val_accumulators[key] = val_accumulators.get(key, 0.0) + val
+                        val_count += 1
+
+                val_avg = {k: v / max(val_count, 1) for k, v in val_accumulators.items()}
+                val_recon_avg = val_avg.get('recon_loss', 0.0)
+
+                # ========== Teacher-specific Recall evaluation ==========
+                # During pretrain, Student is not trained, so we must use Teacher
+                # to generate tokens and compute recall against item embeddings
+                total_recall, total_ndcg, total_hitrate, total = 0.0, 0.0, 0, 0
+
+                with torch.no_grad():
+                    # Prepare faiss index using shared embeddings
+                    item_embs = model.dismir.embeddings.weight.cpu().numpy()
+                    res = faiss.StandardGpuResources()
+                    flat_config = faiss.GpuIndexFlatConfig()
+                    flat_config.device = device.index
+                    gpu_index = faiss.GpuIndexFlatIP(res, hidden_size, flat_config)
+                    gpu_index.add(item_embs)
+
+                    for _, (v_users, v_targets, v_items, v_mask, v_times) in enumerate(valid_data):
+                        # Extract target labels (first item for each user)
+                        target_labels = [t[0] if isinstance(t, (list, tuple)) else t for t in v_targets]
+
+                        # Use Teacher to generate tokens (key: use label as target)
+                        tokens = model.encode_with_teacher(
+                            to_tensor(v_items, device),
+                            to_tensor(target_labels, device),
+                            to_tensor(v_mask, device),
+                            device
+                        )  # (B, num_tokens, hidden_size)
+
+                        # Convert to numpy for faiss search
+                        tokens_np = tokens.cpu().numpy()  # (B, num_tokens, D)
+                        batch_size = tokens_np.shape[0]
+                        num_tokens = tokens_np.shape[1]
+
+                        # Multi-interest evaluation: search with all tokens
+                        # Reshape to (B*num_tokens, D)
+                        tokens_flat = np.reshape(tokens_np, [-1, tokens_np.shape[-1]])
+                        D, I = gpu_index.search(tokens_flat, topN)  # D: distances, I: indices
+
+                        # For each user, aggregate results from all tokens
+                        for i, iid_list in enumerate(v_targets):
+                            recall = 0
+                            dcg = 0.0
+                            item_list_set = set()
+
+                            # Combine results from all tokens for this user
+                            # I[i*num_tokens:(i+1)*num_tokens] gives topN for each token
+                            all_items = list(zip(
+                                np.reshape(I[i*num_tokens:(i+1)*num_tokens], -1),
+                                np.reshape(D[i*num_tokens:(i+1)*num_tokens], -1)
+                            ))
+                            # Sort by distance (inner product) descending
+                            all_items.sort(key=lambda x: x[1], reverse=True)
+
+                            # Select topN unique items
+                            for idx, (item_id, dist) in enumerate(all_items):
+                                if item_id not in item_list_set and item_id != 0:
+                                    item_list_set.add(item_id)
+                                    if len(item_list_set) >= topN:
+                                        break
+
+                            # Calculate metrics
+                            for no, iid in enumerate(item_list_set):
+                                if iid in iid_list:
+                                    recall += 1
+                                    dcg += 1.0 / math.log(no + 2, 2)
+
+                            idcg = 0.0
+                            for no in range(min(recall, len(iid_list))):
+                                idcg += 1.0 / math.log(no + 2, 2)
+
+                            total_recall += recall * 1.0 / len(iid_list)
+                            if recall > 0:
+                                total_ndcg += dcg / idcg if idcg > 0 else 0
+                                total_hitrate += 1
+
+                        total += len(v_targets)
+
+                # Aggregate metrics
+                metrics = {
+                    'recall': total_recall / total if total > 0 else 0,
+                    'ndcg': total_ndcg / total if total > 0 else 0,
+                    'hitrate': total_hitrate * 1.0 / total if total > 0 else 0
+                }
+                # ========== End Teacher-specific evaluation ==========
+
+                test_time = time.time()
+                print(f"[Pretrain-Teacher @ iter {iter_count}] "
+                      f"val_recon: {val_avg.get('recon_loss', 0):.6f}, "
+                      f"val_infonce: {val_avg.get('infonce_loss', 0):.6f}, "
+                      f"val_total: {val_avg.get('total_loss', 0):.6f}  "
+                      f"recall@{topN}: {metrics.get('recall', 0):.6f}, "
+                      f"ndcg@{topN}: {metrics.get('ndcg', 0):.6f}, "
+                      f"hitrate@{topN}: {metrics.get('hitrate', 0):.6f}  "
+                      f"time: {(test_time - start_time) / 60:.2f}min")
+                sys.stdout.flush()
+
+                # Save the LATEST checkpoint every validation (not best)
+                save_teacher_weights(model, teacher_model_path)
+                print(f"[Pretrain-Teacher] Latest checkpoint saved to {teacher_model_path}teacher.pt")
+
+                # Early stopping based on best validation loss (still track it)
+                if val_recon_avg < best_val_loss:
+                    best_val_loss = val_recon_avg
+                    trials = 0
+                else:
+                    trials += 1
+                    if trials > patience:
+                        print("[Pretrain-Teacher] early stopping!")
+                        break
+
+            if iter_count >= max_iter * 1000:
+                break
+
+    except KeyboardInterrupt:
+        print('-' * 99)
+        print('[Pretrain-Teacher] Exiting from training early')
+
+    print(f"[Pretrain Stage-1] Done. Best val_recon={best_val_loss:.6f}")
+    print(f"[Pretrain Stage-1] Latest weights saved to {teacher_model_path}teacher.pt")
+
+
+def output(device, dataset, model_type, item_count, batch_size, lr, seq_len,
             hidden_size, interest_num, topN, exp='eval'):
     
     exp_name = get_exp_name(dataset, model_type, batch_size, lr, hidden_size, seq_len, interest_num, topN, save=False, exp=exp) # 实验名称

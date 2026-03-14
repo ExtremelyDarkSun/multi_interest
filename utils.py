@@ -86,6 +86,13 @@ def get_parser():
     parser.add_argument('--partition_align_temperature', type=float, default=1.0,
                         help='[Partition-Aware DASD-DisMIR] Temperature for partition alignment, default 1.0')
 
+    # [Teacher Pretrain] Two-stage training for DASD-DisMIR
+    # 0: joint training (default, original behaviour)
+    # 1: pretrain Teacher only, save weights to best_model/{exp_name}_teacher/
+    # 2: load pretrained Teacher weights then run normal joint training
+    parser.add_argument('--pretrain', type=int, default=0,
+                        help='[DASD-DisMIR] Teacher pretrain stage: 0=joint(default), 1=pretrain Teacher, 2=joint with pretrained Teacher')
+
     return parser
 
 
