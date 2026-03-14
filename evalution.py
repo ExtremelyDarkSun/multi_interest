@@ -462,27 +462,36 @@ def test(device, test_file, cate_file, dataset, model_type, item_count, batch_si
 
 
 def save_teacher_weights(model, teacher_model_path):
-    """Save only the Tokenizer (Teacher) weights + shared embeddings."""
+    """Save only the Tokenizer (Teacher) weights + teacher_embeddings."""
     if not os.path.exists(teacher_model_path):
         os.makedirs(teacher_model_path)
     state = {
         'tokenizer': model.tokenizer.state_dict(),
         'partition_enhancer': model.partition_enhancer.state_dict(),
         'partition_enhancer_norm': model.partition_enhancer_norm.state_dict(),
-        'embeddings': model.dismir.embeddings.state_dict(),
+        'teacher_embeddings': model.teacher_embeddings.state_dict(),
     }
     torch.save(state, teacher_model_path + 'teacher.pt')
     print(f'Teacher weights saved to {teacher_model_path}teacher.pt')
 
 
 def load_teacher_weights(model, teacher_model_path):
-    """Load Tokenizer (Teacher) weights + shared embeddings into model."""
+    """Load Tokenizer (Teacher) weights + teacher_embeddings into model.
+    Student (dismir) embeddings remain randomly initialized for finetuning."""
     path = teacher_model_path + 'teacher.pt'
     state = torch.load(path, map_location='cpu')
     model.tokenizer.load_state_dict(state['tokenizer'])
     model.partition_enhancer.load_state_dict(state['partition_enhancer'])
     model.partition_enhancer_norm.load_state_dict(state['partition_enhancer_norm'])
-    model.dismir.embeddings.load_state_dict(state['embeddings'])
+    # Load teacher_embeddings for Teacher
+    if 'teacher_embeddings' in state:
+        model.teacher_embeddings.load_state_dict(state['teacher_embeddings'])
+        print("Loaded teacher_embeddings from checkpoint")
+    elif 'embeddings' in state:
+        # Backward compatibility: old checkpoints saved as 'embeddings'
+        model.teacher_embeddings.load_state_dict(state['embeddings'])
+        print("Loaded embeddings (old format) into teacher_embeddings")
+    # NOTE: Student (dismir.embeddings) are NOT loaded - remain randomly initialized
     print(f'Teacher weights loaded from {path}')
 
 
@@ -516,12 +525,12 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
     model.load_confidence_matrix(dataset, data_path='./data/')
     model.set_sampler(args, device=device)
 
-    # Only optimise Teacher-related parameters (+ shared embeddings)
+    # Only optimise Teacher-related parameters (+ teacher_embeddings)
     teacher_params = (
         list(model.tokenizer.parameters()) +
         list(model.partition_enhancer.parameters()) +
         list(model.partition_enhancer_norm.parameters()) +
-        list(model.dismir.embeddings.parameters())
+        list(model.teacher_embeddings.parameters())
     )
     optimizer = torch.optim.Adam(teacher_params, lr=lr,
                                  weight_decay=args.weight_decay)
@@ -595,8 +604,8 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                 total_recall, total_ndcg, total_hitrate, total = 0.0, 0.0, 0, 0
 
                 with torch.no_grad():
-                    # Prepare faiss index using shared embeddings
-                    item_embs = model.dismir.embeddings.weight.cpu().numpy()
+                    # Prepare faiss index using teacher embeddings (trained during pretrain)
+                    item_embs = model.teacher_embeddings.weight.cpu().numpy()
                     res = faiss.StandardGpuResources()
                     flat_config = faiss.GpuIndexFlatConfig()
                     flat_config.device = device.index
