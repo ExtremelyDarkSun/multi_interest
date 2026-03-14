@@ -680,6 +680,13 @@ class DASD_DisMIR(BasicModel):
             temperature=getattr(args, 'partition_align_temperature', 1.0)
         )
         self.lambda_partition_align = getattr(args, 'lambda_partition_align', 0.3)
+
+        # Teacher 专用 embedding（从预训练权重加载）
+        self.teacher_embeddings = nn.Embedding(self.dismir.item_num, hidden_size)
+        # 默认初始化为与 student 相同的值（可选，便于热启动）
+        with torch.no_grad():
+            self.teacher_embeddings.weight.copy_(self.dismir.embeddings.weight)
+
         self.reset_parameters()
     def forward(self, item_list, label_list, mask, times, device, train=True):
         """
@@ -715,9 +722,9 @@ class DASD_DisMIR(BasicModel):
         interests, scores, atten, readout, selection = dismir_output
 
         # 2. Tokenizer前向传播（Teacher）
-        # 获取target和历史序列的嵌入
-        label_eb = self.dismir.embeddings(label_list)  # (batch_size, hidden_size)
-        history_eb = self.dismir.embeddings(item_list)  # (batch_size, seq_len, hidden_size)
+        # 获取target和历史序列的嵌入（Teacher使用独立的teacher_embeddings）
+        label_eb = self.teacher_embeddings(label_list)  # (batch_size, hidden_size)
+        history_eb = self.teacher_embeddings(item_list)  # (batch_size, seq_len, hidden_size)
         # 应用mask
         history_eb = history_eb * mask.unsqueeze(-1)  # (batch_size, seq_len, hidden_size)
 
@@ -852,9 +859,9 @@ class DASD_DisMIR(BasicModel):
         Returns:
             tokens: (batch_size, num_tokens, hidden_size) - Teacher 生成的 tokens
         """
-        # 获取 label 和 history 的 embedding
-        label_eb = self.dismir.embeddings(label_list)  # (batch_size, hidden_size)
-        history_eb = self.dismir.embeddings(item_list)  # (batch_size, seq_len, hidden_size)
+        # 获取 label 和 history 的 embedding（Teacher使用独立的teacher_embeddings）
+        label_eb = self.teacher_embeddings(label_list)  # (batch_size, hidden_size)
+        history_eb = self.teacher_embeddings(item_list)  # (batch_size, seq_len, hidden_size)
         history_eb = history_eb * mask.unsqueeze(-1)  # (batch_size, seq_len, hidden_size)
 
         # 应用 partition_enhancer
@@ -885,9 +892,9 @@ class DASD_DisMIR(BasicModel):
             total_loss: scalar tensor (recon + infonce)
             loss_dict:  per-component loss values
         """
-        # Shared embedding lookup (gradients flow here)
-        label_eb = self.dismir.embeddings(label_list)       # (B, D)
-        history_eb = self.dismir.embeddings(item_list)      # (B, L, D)
+        # Teacher使用独立的teacher_embeddings
+        label_eb = self.teacher_embeddings(label_list)       # (B, D)
+        history_eb = self.teacher_embeddings(item_list)      # (B, L, D)
         history_eb = history_eb * mask.unsqueeze(-1)
 
         # Partition-aware history enhancement (same as joint training)
@@ -942,3 +949,28 @@ class DASD_DisMIR(BasicModel):
         实际的损失计算在forward中完成
         """
         return self.dismir.calculate_disloss(readout, pos_items, selection, interests, atten)
+
+    def load_teacher_from_pretrain(self, checkpoint_path):
+        """
+        从预训练 checkpoint 加载 Teacher 的 embedding 权重
+
+        Args:
+            checkpoint_path: 预训练 checkpoint 路径
+        """
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+        # 尝试从 checkpoint 中获取 embedding 权重
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+
+        # 查找 embedding 权重（可能是 'dismir.embeddings.weight' 或 'embeddings.weight'）
+        embedding_key = None
+        for key in state_dict.keys():
+            if 'embeddings.weight' in key and 'teacher' not in key:
+                embedding_key = key
+                break
+
+        if embedding_key and embedding_key in state_dict:
+            self.teacher_embeddings.weight.data.copy_(state_dict[embedding_key])
+            print(f"Loaded teacher embedding from {embedding_key}")
+        else:
+            print("Warning: Could not find embedding weights in checkpoint")
