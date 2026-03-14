@@ -168,7 +168,7 @@ python src/train.py \
   --num_negatives 1280 \
   --hard_neg_candidates 1280 \
   --pretrain 2 \
-  --exp e1
+  --teacher_ckpt autodl-tmp/REMI/best_model/book_DASD-DisMIR_b128_lr0.001_d64_len20_in4_top50_e1_teacher
 ```
 
 Stage 2 自动从上面路径加载 Teacher 权重，之后和原来联合训练完全一致。

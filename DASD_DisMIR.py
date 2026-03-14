@@ -36,7 +36,7 @@ class ChamferLoss(nn.Module):
         # dist_matrix: (batch_size, K, M)
         # 使用L2距离（p=2）
 
-        tokens = F.normalize(tokens, p=2, dim=-1).detach()  # L2归一化
+        tokens = F.normalize(tokens, p=2, dim=-1)#.detach()  # L2归一化
         interests = F.normalize(interests, p=2, dim=-1)
 
         dist_matrix = torch.cdist(tokens, interests, p=2)
