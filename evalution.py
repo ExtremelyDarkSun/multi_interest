@@ -230,9 +230,16 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
 
     # [Stage-2] Load pretrained Teacher weights before joint training
     if model_type == "DASD-DisMIR" and getattr(args, 'pretrain', 0) == 2:
-        teacher_model_path = "best_model/" + exp_name + "_teacher/"
+        # Use custom path if provided, otherwise auto-generate
+        if getattr(args, 'teacher_ckpt', None) is not None:
+            teacher_model_path = args.teacher_ckpt
+            # Ensure path ends with /
+            if not teacher_model_path.endswith('/'):
+                teacher_model_path += '/'
+        else:
+            teacher_model_path = "best_model/" + exp_name + "_teacher/"
         load_teacher_weights(model, teacher_model_path)
-        print("[Pretrain Stage-2] Teacher weights loaded; proceeding with joint training")
+        print(f"[Pretrain Stage-2] Teacher weights loaded from {teacher_model_path}; proceeding with joint training")
 
     loss_fn = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr = lr, weight_decay=args.weight_decay)

@@ -92,6 +92,8 @@ def get_parser():
     # 2: load pretrained Teacher weights then run normal joint training
     parser.add_argument('--pretrain', type=int, default=0,
                         help='[DASD-DisMIR] Teacher pretrain stage: 0=joint(default), 1=pretrain Teacher, 2=joint with pretrained Teacher')
+    parser.add_argument('--teacher_ckpt', type=str, default=None,
+                        help='[DASD-DisMIR] Path to pretrained teacher checkpoint for stage-2 (default: auto-generate from exp_name)')
 
     return parser
 
