@@ -571,6 +571,8 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                 print(f"[Pretrain-Teacher @ iter {iter_count}] "
                       f"recon: {avg.get('recon_loss', 0):.4f}, "
                       f"infonce: {avg.get('infonce_loss', 0):.4f}, "
+                      f"temp: {avg.get('infonce_temp', 0):.4f}, "
+                      f"logit_scale: {avg.get('infonce_logit_scale', 0):.4f}, "
                       f"part: {avg.get('partition_loss', 0):.4f}, "
                       f"w_part: {avg.get('weighted_partition_loss', 0):.4f}, "
                       f"total: {avg.get('total_loss', 0):.4f}")
@@ -691,6 +693,8 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                 print(f"[Pretrain-Teacher @ iter {iter_count}] "
                       f"val_recon: {val_avg.get('recon_loss', 0):.6f}, "
                       f"val_infonce: {val_avg.get('infonce_loss', 0):.6f}, "
+                      f"val_temp: {val_avg.get('infonce_temp', 0):.4f}, "
+                      f"val_logit_scale: {val_avg.get('infonce_logit_scale', 0):.4f}, "
                       f"val_part: {val_avg.get('partition_loss', 0):.6f}, "
                       f"val_wpart: {val_avg.get('weighted_partition_loss', 0):.6f}, "
                       f"val_total: {val_avg.get('total_loss', 0):.6f}  "

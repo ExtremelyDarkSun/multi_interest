@@ -735,11 +735,13 @@ class DASD_DisMIR(BasicModel):
         num_decoder_layers = 1  # 简化为1层，加速pretrain收敛
         use_token_split = True   # ContextGatedTokenizer默认值
 
+        # Pretrain阶段dropout默认设为0，便于稳定收敛
+        pretrain_dropout = getattr(args, 'pretrain_dropout', 0.0)
         self.tokenizer = ContextGatedTokenizer(
             hidden_size=hidden_size,
             num_tokens=interest_num,
             num_heads=interest_num,
-            dropout=dropout,
+            dropout=pretrain_dropout,
             num_decoder_layers=num_decoder_layers,
             use_token_split=use_token_split
         )
@@ -1016,6 +1018,14 @@ class DASD_DisMIR(BasicModel):
             weighted_partition_loss
         )
 
+        # Calculate current temperature for logging
+        # CLIP-style: temp = base_temperature / exp(logit_scale)
+        base_temp = 0.5  # Same as used in calculate_infonce_loss for pretrain
+        with torch.no_grad():
+            logit_scale = torch.clamp(self.infonce_logit_scale, min=np.log(1/100), max=np.log(100))
+            effective_scale = torch.exp(logit_scale)
+            current_temp = base_temp / effective_scale.item()
+
         loss_dict = {
             'recon_loss':   recon_loss.item(),
             'infonce_loss': infonce_loss.item(),
@@ -1023,6 +1033,8 @@ class DASD_DisMIR(BasicModel):
             'weighted_partition_loss': weighted_partition_loss.item(),
             'lambda_coef': self.dismir.lambda_coef,
             'total_loss':   total_loss.item(),
+            'infonce_temp': current_temp,  # Current adaptive temperature
+            'infonce_logit_scale': logit_scale.item(),  # Raw logit scale
         }
         return total_loss, loss_dict
 
