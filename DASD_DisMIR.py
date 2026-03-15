@@ -203,6 +203,8 @@ class HistoryEncoderLayer(nn.Module):
     """
     单层History编码器：类似Transformer Encoder Layer
     用于递进式编码history序列，每层Decoder对应一层History Encoder
+
+    升级：添加显式残差连接，便于梯度传播，加速pretrain收敛
     """
     def __init__(self, hidden_size, num_heads=4, dropout=0.1):
         super().__init__()
@@ -219,6 +221,9 @@ class HistoryEncoderLayer(nn.Module):
             norm_first=True  # Pre-norm结构，更稳定
         )
 
+        # 显式层归一化（用于残差连接后的归一化）
+        self.norm = nn.LayerNorm(hidden_size)
+
     def forward(self, x, mask=None):
         """
         Args:
@@ -227,13 +232,18 @@ class HistoryEncoderLayer(nn.Module):
         Returns:
             encoded: [batch_size, seq_len, hidden_size]
         """
+        residual = x
+
         # 处理mask: Transformer需要key_padding_mask (True=padding)
         key_pad_mask = (mask == 0) if mask is not None else None
 
         # Transformer encoding (内部包含Self-Attn + FFN + Residual)
-        encoded = self.layer(x, src_key_padding_mask=key_pad_mask)
+        out = self.layer(x, src_key_padding_mask=key_pad_mask)
 
-        return encoded
+        # 显式残差连接 + 层归一化（双重残差，便于梯度传播）
+        out = self.norm(out + residual)
+
+        return out
 
 
 class Qwen3NextRMSNorm(nn.Module):
@@ -710,7 +720,6 @@ class DASD_DisMIR(BasicModel):
         self.rlambda = getattr(args, 'rlambda', 0.0)
 
         # InfoNCE温度参数（CLIP-style log自适应温度）
-        # 初始值对应temperature=0.07: log(1/0.07) ≈ 2.66
         self.infonce_logit_scale = nn.Parameter(torch.ones(1) * np.log(1/0.07))
 
         # 保持DisMIR的name属性，用于evaluate函数中的模型识别
@@ -723,7 +732,7 @@ class DASD_DisMIR(BasicModel):
 
         # 初始化Tokenizer (Teacher模型)
         # 硬编码DASD调好的参数值
-        num_decoder_layers = 4  # ContextGatedTokenizer默认值
+        num_decoder_layers = 1  # 简化为1层，加速pretrain收敛
         use_token_split = True   # ContextGatedTokenizer默认值
 
         self.tokenizer = ContextGatedTokenizer(
@@ -939,7 +948,7 @@ class DASD_DisMIR(BasicModel):
             tokens: (batch_size, num_tokens, hidden_size) - Teacher 生成的 tokens
         """
         # 获取 label 和 history 的 embedding（Teacher使用独立的teacher_embeddings）
-        label_eb = self.teacher_embeddings(label_list)  # (batch_size, hidden_size)
+        label_eb = self.teacher_embeddings(label_list).detach()  # (batch_size, hidden_size)
         history_eb = self.teacher_embeddings(item_list)  # (batch_size, seq_len, hidden_size)
         history_eb = history_eb * mask.unsqueeze(-1)  # (batch_size, seq_len, hidden_size)
 
@@ -972,7 +981,7 @@ class DASD_DisMIR(BasicModel):
             loss_dict:  per-component loss values
         """
         # Teacher使用独立的teacher_embeddings
-        label_eb = self.teacher_embeddings(label_list)       # (B, D)
+        label_eb = self.teacher_embeddings(label_list).detach()       # (B, D)
         history_eb = self.teacher_embeddings(item_list)      # (B, L, D)
         history_eb = history_eb * mask.unsqueeze(-1)
 
@@ -1000,16 +1009,19 @@ class DASD_DisMIR(BasicModel):
             item_list, mask, self.teacher_embeddings, seed=deterministic_seed
         )
 
+        weighted_partition_loss = self.dismir.lambda_coef * partition_loss
         total_loss = (
             self.lambda_recon * recon_loss +
             self.lambda_infonce * infonce_loss +
-            self.dismir.lambda_coef * partition_loss
+            weighted_partition_loss
         )
 
         loss_dict = {
             'recon_loss':   recon_loss.item(),
             'infonce_loss': infonce_loss.item(),
             'partition_loss': partition_loss.item(),
+            'weighted_partition_loss': weighted_partition_loss.item(),
+            'lambda_coef': self.dismir.lambda_coef,
             'total_loss':   total_loss.item(),
         }
         return total_loss, loss_dict
