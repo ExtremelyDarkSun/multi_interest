@@ -571,6 +571,8 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                 print(f"[Pretrain-Teacher @ iter {iter_count}] "
                       f"recon: {avg.get('recon_loss', 0):.4f}, "
                       f"infonce: {avg.get('infonce_loss', 0):.4f}, "
+                      f"part: {avg.get('partition_loss', 0):.4f}, "
+                      f"w_part: {avg.get('weighted_partition_loss', 0):.4f}, "
                       f"total: {avg.get('total_loss', 0):.4f}")
                 loss_accumulators = {}
 
@@ -601,6 +603,7 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                 # ========== Teacher-specific Recall evaluation ==========
                 # During pretrain, Student is not trained, so we must use Teacher
                 # to generate tokens and compute recall against item embeddings
+                # NOTE: Use the same label for train and eval (first label only)
                 total_recall, total_ndcg, total_hitrate, total = 0.0, 0.0, 0, 0
 
                 with torch.no_grad():
@@ -614,6 +617,7 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
 
                     for _, (v_users, v_targets, v_items, v_mask, v_times) in enumerate(valid_data):
                         # Extract target labels (first item for each user)
+                        # Both train and eval use the first label only
                         target_labels = [t[0] if isinstance(t, (list, tuple)) else t for t in v_targets]
 
                         # Use Teacher to generate tokens (key: use label as target)
@@ -635,7 +639,8 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                         D, I = gpu_index.search(tokens_flat, topN)  # D: distances, I: indices
 
                         # For each user, aggregate results from all tokens
-                        for i, iid_list in enumerate(v_targets):
+                        # NOTE: Evaluate against the first label only (same as training)
+                        for i, target_label in enumerate(target_labels):
                             recall = 0
                             dcg = 0.0
                             item_list_set = set()
@@ -656,22 +661,23 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                                     if len(item_list_set) >= topN:
                                         break
 
-                            # Calculate metrics
+                            # Calculate metrics against the single target label
+                            # Same as training: only care about the first label
+                            target_found = False
                             for no, iid in enumerate(item_list_set):
-                                if iid in iid_list:
-                                    recall += 1
-                                    dcg += 1.0 / math.log(no + 2, 2)
+                                if iid == target_label:
+                                    recall = 1  # Found the target
+                                    dcg = 1.0 / math.log(no + 2, 2)
+                                    target_found = True
+                                    break
 
-                            idcg = 0.0
-                            for no in range(min(recall, len(iid_list))):
-                                idcg += 1.0 / math.log(no + 2, 2)
-
-                            total_recall += recall * 1.0 / len(iid_list)
-                            if recall > 0:
-                                total_ndcg += dcg / idcg if idcg > 0 else 0
+                            # For single-label evaluation: recall is either 0 or 1
+                            total_recall += recall  # recall is 0 or 1
+                            if target_found:
+                                total_ndcg += dcg  # dcg = 1/log2(rank+2), idcg = 1 for single item
                                 total_hitrate += 1
 
-                        total += len(v_targets)
+                        total += len(target_labels)
 
                 # Aggregate metrics
                 metrics = {
@@ -685,6 +691,8 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                 print(f"[Pretrain-Teacher @ iter {iter_count}] "
                       f"val_recon: {val_avg.get('recon_loss', 0):.6f}, "
                       f"val_infonce: {val_avg.get('infonce_loss', 0):.6f}, "
+                      f"val_part: {val_avg.get('partition_loss', 0):.6f}, "
+                      f"val_wpart: {val_avg.get('weighted_partition_loss', 0):.6f}, "
                       f"val_total: {val_avg.get('total_loss', 0):.6f}  "
                       f"recall@{topN}: {metrics.get('recall', 0):.6f}, "
                       f"ndcg@{topN}: {metrics.get('ndcg', 0):.6f}, "
