@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
+import numpy as np
 
 
 # ============ 1. ChamferLoss ============
@@ -133,7 +134,9 @@ class PartitionAlignedLoss(nn.Module):
 
 
 # ============ 4. TargetAwareFusion ============
-
+# NOTE: 该类当前未被使用，实际使用的是 dismir.read_out() 进行硬选择
+# 保留代码以备后续可能需要注意力融合机制
+'''
 class TargetAwareFusion(nn.Module):
     """
     Target-Aware Fusion (目标感知融合层)
@@ -191,9 +194,47 @@ class TargetAwareFusion(nn.Module):
         fused_vector = fused_vector.squeeze(1)  # (batch_size, hidden_size)
 
         return fused_vector
+'''
 
 
 # ============ 3. Tokenizer 相关组件 ============
+
+class HistoryEncoderLayer(nn.Module):
+    """
+    单层History编码器：类似Transformer Encoder Layer
+    用于递进式编码history序列，每层Decoder对应一层History Encoder
+    """
+    def __init__(self, hidden_size, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.hidden_size = hidden_size
+
+        # Self-Attention + FFN (使用TransformerEncoderLayer，包含残差连接)
+        self.layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=num_heads,
+            dim_feedforward=hidden_size * 4,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True  # Pre-norm结构，更稳定
+        )
+
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: [batch_size, seq_len, hidden_size] - 输入序列
+            mask: [batch_size, seq_len] - 1=valid, 0=padding
+        Returns:
+            encoded: [batch_size, seq_len, hidden_size]
+        """
+        # 处理mask: Transformer需要key_padding_mask (True=padding)
+        key_pad_mask = (mask == 0) if mask is not None else None
+
+        # Transformer encoding (内部包含Self-Attn + FFN + Residual)
+        encoded = self.layer(x, src_key_padding_mask=key_pad_mask)
+
+        return encoded
+
 
 class Qwen3NextRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -317,6 +358,12 @@ class Qwen3NextCrossAttention(nn.Module):
             self.num_key_value_heads * hidden_size,
             bias=False
         )
+        # Value 投影：处理 history_emb，维度保持为 hidden_size
+        self.v_proj = nn.Linear(
+            hidden_size,
+            self.num_key_value_heads * hidden_size,
+            bias=False
+        )
         self.target_proj = nn.Linear(
             hidden_size,
             hidden_size,
@@ -384,13 +431,12 @@ class Qwen3NextCrossAttention(nn.Module):
             # [batch_size * num_tokens, hidden_size] -> [batch_size, num_tokens, hidden_size]
             query_states = query_states_flat.view(batch_size, self.num_tokens, self.hidden_size)
 
-        # 2. Key 投影，Value 直接从 history_emb 提取
+        # 2. Key 投影和 Value 投影
         # key_states: [batch_size, seq_len, num_key_value_heads, hidden_size]
         key_states = self.k_proj(history_emb).view(batch_size, seq_len, self.num_key_value_heads, self.hidden_size)
 
-        # value_states 直接从原生 history_emb 提取，并扩展到 num_key_value_heads
-        # [batch_size, seq_len, hidden_size] -> [batch_size, seq_len, num_key_value_heads, hidden_size]
-        value_states = history_emb.unsqueeze(2).expand(-1, -1, self.num_key_value_heads, -1)
+        # value_states: [batch_size, seq_len, num_key_value_heads, hidden_size]
+        value_states = self.v_proj(history_emb).view(batch_size, seq_len, self.num_key_value_heads, self.hidden_size)
 
         # 3. Q/K 归一化
         query_states = self.q_norm(query_states)
@@ -446,7 +492,7 @@ class ContextGatedTokenizer(nn.Module):
     4. num_tokens 直接对应注意力头数
     5. 支持token切分模式（use_token_split）
     6. 支持多层叠加，每层包含：Cross-Attention + Self-Attention + FFN（标准Decoder Layer）
-    7. 第一层不使用残差连接（避免target信息泄露），后续层使用残差连接
+    7. 第一层不使用残差连接（强制模型学习用target查询history，避免target信息直接传递），后续层使用残差连接
     """
 
     def __init__(self, hidden_size, num_tokens=4, num_heads=4, num_key_value_heads=None,
@@ -456,6 +502,19 @@ class ContextGatedTokenizer(nn.Module):
         self.num_tokens = num_tokens
         self.use_token_split = use_token_split
         self.num_decoder_layers = num_decoder_layers
+
+        # --- 递进式 History Encoder ---
+        # 每层Decoder对应一层History Encoder，递进式编码
+        self.history_enc_layers = nn.ModuleList()
+        self.history_pos_emb = nn.Embedding(1000, hidden_size)  # 位置编码（只在第一层前加）
+
+        for layer_idx in range(num_decoder_layers):
+            history_enc = HistoryEncoderLayer(
+                hidden_size=hidden_size,
+                num_heads=num_tokens if hidden_size % num_tokens == 0 else 4,
+                dropout=dropout
+            )
+            self.history_enc_layers.append(history_enc)
 
         # --- 多层 Decoder Layer：Cross-Attention + Self-Attention + FFN ---
         self.cross_attn_layers = nn.ModuleList()
@@ -541,39 +600,48 @@ class ContextGatedTokenizer(nn.Module):
         # 转换 mask: True 表示 padding/ignore
         key_padding_mask = (mask == 0)
 
-        # ===== 多层 Decoder Layer 叠加 =====
-        # 每层结构：Cross-Attention → Self-Attention → FFN
+        # ===== 递进式 History Encoding + Decoder Layer 叠加 =====
+        # 每层结构：HistoryEncoder → Cross-Attention → Self-Attention → FFN
 
-        # 第一层：从 target_emb [B, D] 生成 num_tokens 个 query
-        # 1. Cross-Attention（不使用残差连接，避免 target 信息泄露）
+        # 添加初始位置编码到history
+        seq_len = history_emb.size(1)
+        positions = torch.arange(seq_len, device=history_emb.device)
+        h = history_emb + self.history_pos_emb(positions).unsqueeze(0)
+
+        # 第一层：递进式History编码 + Cross-Attention
+        # 1. 第一层History Encoding
+        h = self.history_enc_layers[0](h, mask)
+
+        # 2. Cross-Attention（不使用残差连接，强制模型学习用target查询history）
         context, _ = self.cross_attn_layers[0](
             target_emb=target_emb,  # [B, hidden_size]
-            history_emb=history_emb,
+            history_emb=h,  # 使用递进式编码后的history
             key_padding_mask=key_padding_mask
         )
         # context: [B, num_tokens, hidden_size]
         context = self.cross_attn_dropouts[0](self.cross_attn_norms[0](context))
-        # 第一层不使用残差连接
+        # 第一层不使用残差连接：强制模型通过Cross-Attention学习target-history交互，
+        # 而不是直接将target信息传递到后续层
 
-        # 2. Self-Attention + FFN（TransformerEncoderLayer 内部有残差连接）
+        # 3. Self-Attention + FFN（TransformerEncoderLayer 内部有残差连接）
         context = self.self_attn_layers[0](context)
 
-        # 后续层：使用残差连接
+        # 后续层：递进式History编码 + 使用残差连接
         for layer_idx in range(1, self.num_decoder_layers):
-            # 保存残差
-            residual = context
+            # 1. 递进式History Encoding：在上层history基础上继续编码
+            h = self.history_enc_layers[layer_idx](h, mask)
 
-            # Pre-norm: 先归一化，再 attention
+            # 2. Cross-Attention with residual
+            residual = context
             normed_context = self.cross_attn_norms[layer_idx](context)
             new_context, _ = self.cross_attn_layers[layer_idx](
                 target_emb=normed_context,
-                history_emb=history_emb,
+                history_emb=h,  # 使用递进式编码后的history
                 key_padding_mask=key_padding_mask
             )
-
-            # 残差连接（不再需要对 new_context 归一化）
             context = residual + self.cross_attn_dropouts[layer_idx](new_context)
-            # 2. Self-Attention + FFN（TransformerEncoderLayer 内部有残差连接）
+
+            # 3. Self-Attention + FFN（TransformerEncoderLayer 内部有残差连接）
             context = self.self_attn_layers[layer_idx](context)
 
         # ===== 最终处理 =====
@@ -641,6 +709,10 @@ class DASD_DisMIR(BasicModel):
         self.lambda_infonce = getattr(args, 'lambda_infonce', 0.1)
         self.rlambda = getattr(args, 'rlambda', 0.0)
 
+        # InfoNCE温度参数（CLIP-style log自适应温度）
+        # 初始值对应temperature=0.07: log(1/0.07) ≈ 2.66
+        self.infonce_logit_scale = nn.Parameter(torch.ones(1) * np.log(1/0.07))
+
         # 保持DisMIR的name属性，用于evaluate函数中的模型识别
         self.name = 'DASD-DisMIR'
 
@@ -664,7 +736,8 @@ class DASD_DisMIR(BasicModel):
         )
 
         # 初始化TargetAwareFusion (目标感知融合层)
-        self.fusion = TargetAwareFusion(hidden_size)
+        # NOTE: 当前未使用，实际使用 dismir.read_out() 进行硬选择
+        # self.fusion = TargetAwareFusion(hidden_size)
 
         # Loss模块
         self.chamfer_loss = ChamferLoss()
@@ -723,7 +796,7 @@ class DASD_DisMIR(BasicModel):
 
         # 2. Tokenizer前向传播（Teacher）
         # 获取target和历史序列的嵌入（Teacher使用独立的teacher_embeddings）
-        label_eb = self.teacher_embeddings(label_list)  # (batch_size, hidden_size)
+        label_eb = self.teacher_embeddings(label_list).detach()  # (batch_size, hidden_size)
         history_eb = self.teacher_embeddings(item_list)  # (batch_size, seq_len, hidden_size)
         # 应用mask
         history_eb = history_eb * mask.unsqueeze(-1)  # (batch_size, seq_len, hidden_size)
@@ -761,7 +834,7 @@ class DASD_DisMIR(BasicModel):
 
         # 4.4 InfoNCE Loss
         # 拉近同一target的tokens和对应label_emb的距离，拉远与batch内其他label_emb的距离
-        infonce_loss = self.calculate_infonce_loss(tokens, label_eb, temperature=0.08)#0.07
+        infonce_loss = self.calculate_infonce_loss(tokens, label_eb, base_temperature=0.08)
 
         # 4.5 DisMIR原有分区损失（Partition Loss）
         # 使用确定性种子确保与DisMIR一致
@@ -801,9 +874,9 @@ class DASD_DisMIR(BasicModel):
 
         return interests, total_loss, loss_dict
 
-    def calculate_infonce_loss(self, tokens, label_eb, temperature=0.07):
+    def calculate_infonce_loss(self, tokens, label_eb, base_temperature=0.07):
         """
-        计算InfoNCE Loss
+        计算InfoNCE Loss (使用CLIP-style log自适应温度)
 
         拉近同一target的tokens（多个）和对应label_emb的距离，
         拉远与batch内其他label_emb的距离。
@@ -811,36 +884,42 @@ class DASD_DisMIR(BasicModel):
         Args:
             tokens: Teacher生成的tokens (batch_size, num_tokens, hidden_size)
             label_eb: 目标物品嵌入 (batch_size, hidden_size)
-            temperature: 温度参数，默认0.07（DASD硬编码值）
+            base_temperature: 基础温度参数，默认0.07
 
         Returns:
             infonce_loss: InfoNCE损失值
         """
         batch_size, num_tokens, hidden_size = tokens.shape
 
+        # CLIP-style log自适应温度
+        # 限制logit_scale的范围防止极端值: [log(1/100), log(100)]
+        logit_scale = torch.clamp(self.infonce_logit_scale, min=np.log(1/100), max=np.log(100))
+        # effective_scale = exp(logit_scale), 温度 = base_temperature / effective_scale
+        # 或者直接: similarity * exp(logit_scale) / base_temperature
+        effective_scale = torch.exp(logit_scale)
+
         # 归一化tokens和label_eb
         tokens_norm = F.normalize(tokens, dim=-1)  # (batch_size, num_tokens, hidden_size)
         label_eb_norm = F.normalize(label_eb, dim=-1)  # (batch_size, hidden_size)
 
-        # 计算每个token与所有label_emb的相似度
-        # tokens_norm: (batch_size, num_tokens, hidden_size)
-        # label_eb_norm: (batch_size, hidden_size) -> (batch_size, 1, hidden_size)
-        label_eb_expanded = label_eb_norm.unsqueeze(1)  # (batch_size, 1, hidden_size)
-
         # 计算相似度矩阵
-        # 对于每个样本的每个token，计算与batch内所有label的相似度
         tokens_flat = tokens_norm.view(batch_size * num_tokens, hidden_size)  # (batch_size * num_tokens, hidden_size)
         label_eb_all = label_eb_norm  # (batch_size, hidden_size)
 
         # 计算相似度: (batch_size * num_tokens, batch_size)
-        similarity = torch.matmul(tokens_flat, label_eb_all.t()) / temperature
+        # 使用自适应scale: similarity * effective_scale / base_temperature
+        similarity = torch.matmul(tokens_flat, label_eb_all.t()) * effective_scale / base_temperature
 
         # 创建标签：每个token对应的正样本是其所属样本的label
-        # token i (i = batch_idx * num_tokens + token_idx) 的正样本是 label[batch_idx]
         labels = torch.arange(batch_size, device=tokens.device).repeat_interleave(num_tokens)
 
         # 计算InfoNCE loss (交叉熵)
         infonce_loss = F.cross_entropy(similarity, labels)
+
+        # 监控温度值（训练时）
+        if self.training and batch_size % 100 == 0:  # 每隔一定batch打印
+            current_temp = base_temperature / effective_scale.item()
+            print(f"[InfoNCE] temp={current_temp:.4f}, logit_scale={logit_scale.item():.4f}")
 
         return infonce_loss
 
@@ -911,16 +990,104 @@ class DASD_DisMIR(BasicModel):
         )
 
         # InfoNCE loss (Teacher tokens vs target labels)
-        infonce_loss = self.calculate_infonce_loss(tokens, label_eb, temperature=0.5)
+        infonce_loss = self.calculate_infonce_loss(tokens, label_eb, base_temperature=0.5)
 
         total_loss = self.lambda_recon * recon_loss + self.lambda_infonce * infonce_loss
+
+        # Partition loss using Teacher embeddings (not Student embeddings)
+        deterministic_seed = 42 + item_list.sum().item() % 10000
+        partition_loss = self.compute_partition_loss_with_embeddings(
+            item_list, mask, self.teacher_embeddings, seed=deterministic_seed
+        )
+
+        total_loss = (
+            self.lambda_recon * recon_loss +
+            self.lambda_infonce * infonce_loss +
+            self.dismir.lambda_coef * partition_loss
+        )
 
         loss_dict = {
             'recon_loss':   recon_loss.item(),
             'infonce_loss': infonce_loss.item(),
+            'partition_loss': partition_loss.item(),
             'total_loss':   total_loss.item(),
         }
         return total_loss, loss_dict
+
+    def compute_partition_loss_with_embeddings(self, items, mask, embeddings, seed=None):
+        """
+        Compute partition loss using specified embeddings (not self.dismir.embeddings).
+        This allows Teacher to use its own embeddings during pretraining.
+
+        Args:
+            items: (batch_size, seq_len) item ids
+            mask: (batch_size, seq_len) padding mask
+            embeddings: nn.Embedding to use for lookup
+            seed: Optional random seed for reproducible sampling
+
+        Returns:
+            partition_loss: scalar tensor
+        """
+        import numpy as np
+
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+
+        batch_size, seq_len = items.shape
+        partition_groups = self.dismir.partition_groups
+        num_negatives = self.dismir.num_negatives
+        item_num = self.dismir.item_num
+
+        # Get item embeddings using provided embedding table
+        item_eb = embeddings(items)  # (B, L, D)
+        mask_expanded = mask.unsqueeze(-1).float()
+        item_eb = item_eb * mask_expanded
+
+        # Flatten for batch processing (B*L, K)
+        item_eb_flat = item_eb.view(-1, partition_groups)
+        item_weights = item_eb_flat
+
+        # Sample positive neighbors from confidence matrix (reuse dismir's method)
+        pos_samples = self.dismir.sample_positive_neighbors(items, num_pos=1)
+        pos_samples_flat = pos_samples.view(-1)
+        pos_eb = embeddings(pos_samples_flat)  # (B*L, K)
+
+        # Sample negative items
+        neg_samples = torch.randint(0, item_num,
+                                    (batch_size * seq_len, num_negatives),
+                                    device=items.device)
+        neg_eb = embeddings(neg_samples)  # (B*L, N, K)
+
+        pos_weights = pos_eb
+        neg_weights = neg_eb
+
+        # Compute similarities
+        pos_sim = (item_weights * pos_weights).sum(dim=-1)  # (B*L,)
+        neg_sim = torch.matmul(
+            item_weights.unsqueeze(1),
+            neg_weights.transpose(-2, -1)
+        ).squeeze(1)  # (B*L, N)
+
+        # InfoNCE loss
+        temperature = 1.0
+        pos_sim = torch.clamp(pos_sim / temperature, min=-10, max=10)
+        neg_sim = torch.clamp(neg_sim / temperature, min=-10, max=10)
+
+        pos_exp = torch.exp(pos_sim)
+        neg_exp = torch.exp(neg_sim).sum(dim=-1)
+
+        loss = -torch.log(pos_exp / (pos_exp + neg_exp + 1e-9))
+
+        # Apply mask
+        mask_flat = mask.view(-1).float()
+        loss = (loss * mask_flat).sum() / (mask_flat.sum() + 1e-9)
+
+        if torch.isnan(loss):
+            print(f"[Warning] partition_loss is NaN, returning 0")
+            return torch.tensor(0.0, device=items.device)
+
+        return loss
 
     # ============ 兼容DisMIR接口的方法 ============
 
@@ -950,6 +1117,9 @@ class DASD_DisMIR(BasicModel):
         """
         return self.dismir.calculate_disloss(readout, pos_items, selection, interests, atten)
 
+    # NOTE: 该方法当前未被使用，实际加载Teacher权重使用 evalution.py 中的 load_teacher_weights 函数
+    # 保留代码以备后续可能需要独立加载功能
+    '''
     def load_teacher_from_pretrain(self, checkpoint_path):
         """
         从预训练 checkpoint 加载 Teacher 的 embedding 权重
@@ -974,3 +1144,4 @@ class DASD_DisMIR(BasicModel):
             print(f"Loaded teacher embedding from {embedding_key}")
         else:
             print("Warning: Could not find embedding weights in checkpoint")
+    '''

@@ -141,7 +141,7 @@ python src/train.py \
   --num_negatives 1280 \
   --hard_neg_candidates 1280 \
   --pretrain 1 \
-  --exp e1
+  --exp e3
 ```
 
 Stage 1 只训练 Teacher，结束后权重保存在：
