@@ -470,6 +470,7 @@ def save_teacher_weights(model, teacher_model_path):
         'partition_enhancer': model.partition_enhancer.state_dict(),
         'partition_enhancer_norm': model.partition_enhancer_norm.state_dict(),
         'teacher_embeddings': model.teacher_embeddings.state_dict(),
+        'infonce_logit_scale': model.infonce_logit_scale,
     }
     torch.save(state, teacher_model_path + 'teacher.pt')
     print(f'Teacher weights saved to {teacher_model_path}teacher.pt')
@@ -491,6 +492,10 @@ def load_teacher_weights(model, teacher_model_path):
         # Backward compatibility: old checkpoints saved as 'embeddings'
         model.teacher_embeddings.load_state_dict(state['embeddings'])
         print("Loaded embeddings (old format) into teacher_embeddings")
+    # Load infonce_logit_scale (adaptive temperature)
+    if 'infonce_logit_scale' in state:
+        model.infonce_logit_scale.data.copy_(state['infonce_logit_scale'])
+        print(f"Loaded infonce_logit_scale: {model.infonce_logit_scale.item():.4f}")
     # NOTE: Student (dismir.embeddings) are NOT loaded - remain randomly initialized
     print(f'Teacher weights loaded from {path}')
 
@@ -530,7 +535,8 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
         list(model.tokenizer.parameters()) +
         list(model.partition_enhancer.parameters()) +
         list(model.partition_enhancer_norm.parameters()) +
-        list(model.teacher_embeddings.parameters())
+        list(model.teacher_embeddings.parameters()) +
+        [model.infonce_logit_scale]  # CLIP-style adaptive temperature
     )
     optimizer = torch.optim.Adam(teacher_params, lr=lr,
                                  weight_decay=args.weight_decay)
