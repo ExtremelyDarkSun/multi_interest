@@ -95,6 +95,10 @@ def get_parser():
     parser.add_argument('--teacher_ckpt', type=str, default=None,
                         help='[DASD-DisMIR] Path to pretrained teacher checkpoint for stage-2 (default: auto-generate from exp_name)')
 
+    # [Multi-Target Distillation] Extra future labels for DASD-DisMIR alignment
+    parser.add_argument('--num_future_labels', type=int, default=2,
+                        help='[DASD-DisMIR] Number of extra future-click targets for multi-target Teacher distillation (default: 2, total 3 targets)')
+
     return parser
 
 
@@ -104,7 +108,8 @@ class DataIterator(torch.utils.data.IterableDataset):
                  batch_size=128,
                  seq_len=100,
                  train_flag=1,
-                 time_span = 128
+                 time_span = 128,
+                 num_future_labels = 2
                 ):
         print("Using time span", time_span)
         self.read(source) # 读取数据，获取用户列表和对应的按时间戳排序的物品序列，每个用户对应一个物品list
@@ -116,6 +121,7 @@ class DataIterator(torch.utils.data.IterableDataset):
         self.train_flag = train_flag # train_flag=1表示训练
         self.seq_len = seq_len # 历史物品序列的最大长度
         self.index = 0 # 验证和测试时选择用户的位置的标记
+        self.num_future_labels = num_future_labels  # [Multi-Target] Number of extra future labels
         print("total user:", len(self.users))
         print("total items:", len(self.items))
 
@@ -211,6 +217,7 @@ class DataIterator(torch.utils.data.IterableDataset):
         time_matrix_list = []
         hist_mask_list = []
         adj_matrix_list = []
+        future_labels_list = []  # [Multi-Target] extra future targets for each sample
 
         for user_id in user_id_list:
             item_list = self.graph[user_id] # 排序后的user的item序列
@@ -219,6 +226,24 @@ class DataIterator(torch.utils.data.IterableDataset):
             if self.train_flag == 1: # 训练，选取训练时的label
                 k = random.choice(range(4, len(item_list))) # 从[4,len(item_list))中随机选择一个index
                 item_id_list.append(item_list[k]) # 该index对应的item加入item_id_list
+
+                # [Multi-Target] Build future_labels for this sample
+                num_future = self.num_future_labels
+                future = []
+                # Try to use real future clicks: item_list[k+1], item_list[k+2], ...
+                for delta in range(1, num_future + 1):
+                    if k + delta < len(item_list):
+                        future.append(item_list[k + delta])
+                # Fill with recent history items if not enough future clicks
+                fill_idx = 1
+                while len(future) < num_future:
+                    if k - fill_idx >= 0:
+                        future.append(item_list[k - fill_idx])
+                    else:
+                        future.append(item_list[k])  # extreme fallback: repeat current label
+                    fill_idx += 1
+                future_labels_list.append(future)  # (num_future_labels,)
+
             else: # 验证、测试，选取该user后20%的item用于验证、测试
                 k = int(len(item_list) * 0.8)
                 item_id_list.append(item_list[k:])
@@ -239,12 +264,18 @@ class DataIterator(torch.utils.data.IterableDataset):
 
         # 返回用户列表（batch_size）、物品列表（label）（batch_size）、
         # 历史物品列表（batch_size，seq_len）、历史物品的mask列表（batch_size，seq_len）
-        return user_id_list, item_id_list, hist_item_list, hist_mask_list, (time_matrix_list, adj_matrix_list)
+        if self.train_flag == 1:
+            # Training: also return future_labels_list (batch_size, num_future_labels)
+            return user_id_list, item_id_list, hist_item_list, hist_mask_list, (time_matrix_list, adj_matrix_list), future_labels_list
+        else:
+            return user_id_list, item_id_list, hist_item_list, hist_mask_list, (time_matrix_list, adj_matrix_list)
         # return user_id_list, item_id_list, hist_item_list, hist_mask_list, hist_time_list
 
 
 def get_DataLoader(source, batch_size, seq_len, train_flag=1, args=None):
-    dataIterator = DataIterator(source, batch_size, seq_len, train_flag)
+    num_future_labels = getattr(args, 'num_future_labels', 2) if args is not None else 2
+    dataIterator = DataIterator(source, batch_size, seq_len, train_flag,
+                                num_future_labels=num_future_labels)
     return DataLoader(dataIterator, batch_size=None, batch_sampler=None)
 
 

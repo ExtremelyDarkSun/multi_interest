@@ -259,7 +259,16 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
         best_metric = 0 # 最佳指标值，在这里是最佳recall值
         loss_print_interval = getattr(args, 'loss_print_interval', 100)
         #scheduler.step()
-        for i, (users, targets, items, mask, times) in enumerate(train_data):
+        for i, batch in enumerate(train_data):
+            # [Multi-Target] Training batches now contain 6 elements when num_future_labels > 0:
+            # (users, targets, items, mask, times, future_labels)
+            # Eval/test batches (train_flag=0) still have 5 elements; future_labels = None.
+            if len(batch) == 6:
+                users, targets, items, mask, times, future_labels_raw = batch
+                future_labels = to_tensor(future_labels_raw, device)  # (B, num_future_labels)
+            else:
+                users, targets, items, mask, times = batch
+                future_labels = None
             model.train()
             iter += 1
             optimizer.zero_grad()
@@ -348,7 +357,9 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
                 # [DASD-DisMIR] Knowledge Distillation with DisMIR
                 # Returns (interests, total_loss, loss_dict) in training mode
                 interests, total_loss, loss_dict = model(
-                    to_tensor(items, device), pos_items, to_tensor(mask, device), times_tensor, device, train=True
+                    to_tensor(items, device), pos_items, to_tensor(mask, device),
+                    times_tensor, device, train=True,
+                    future_labels=future_labels  # [Multi-Target] pass extra labels (or None)
                 )
                 loss = total_loss
 
@@ -362,12 +373,12 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
                 if iter % loss_print_interval == 0 and iter > 0:
                     avg_losses = {k: v/loss_print_interval for k, v in loss_accumulators.items()}
                     print(f"[DASD-DisMIR Loss Details @ iter {iter}] "
-                          f"main: {avg_losses.get('main_loss', 0):.4f}, "
-                          f"recon: {avg_losses.get('recon_loss', 0):.4f}, "
-                          f"align: {avg_losses.get('align_loss', 0):.4f}, "
-                          f"part_align: {avg_losses.get('partition_align_loss', 0):.4f}, "
-                          f"infonce: {avg_losses.get('infonce_loss', 0):.4f}, "
-                          f"partition: {avg_losses.get('partition_loss', 0):.4f}")
+                          f"select_bpr: {avg_losses.get('select_bpr_loss', 0):.4f}, "
+                          f"uniformity: {avg_losses.get('uniformity_loss', 0):.4f}, "
+                          f"teacher_mse: {avg_losses.get('teacher_mse', 0):.4f}, "
+                          f"partition: {avg_losses.get('partition_loss', 0):.4f}, "
+                          f"atten: {avg_losses.get('atten_loss', 0):.4f}, "
+                          f"total: {avg_losses.get('total_loss', 0):.4f}")
                     # Reset accumulators
                     loss_accumulators = {}
             else:
@@ -467,10 +478,7 @@ def save_teacher_weights(model, teacher_model_path):
         os.makedirs(teacher_model_path)
     state = {
         'tokenizer': model.tokenizer.state_dict(),
-        'partition_enhancer': model.partition_enhancer.state_dict(),
-        'partition_enhancer_norm': model.partition_enhancer_norm.state_dict(),
         'teacher_embeddings': model.teacher_embeddings.state_dict(),
-        'infonce_logit_scale': model.infonce_logit_scale,
     }
     torch.save(state, teacher_model_path + 'teacher.pt')
     print(f'Teacher weights saved to {teacher_model_path}teacher.pt')
@@ -482,8 +490,6 @@ def load_teacher_weights(model, teacher_model_path):
     path = teacher_model_path + 'teacher.pt'
     state = torch.load(path, map_location='cpu')
     model.tokenizer.load_state_dict(state['tokenizer'])
-    model.partition_enhancer.load_state_dict(state['partition_enhancer'])
-    model.partition_enhancer_norm.load_state_dict(state['partition_enhancer_norm'])
     # Load teacher_embeddings for Teacher
     if 'teacher_embeddings' in state:
         model.teacher_embeddings.load_state_dict(state['teacher_embeddings'])
@@ -492,10 +498,6 @@ def load_teacher_weights(model, teacher_model_path):
         # Backward compatibility: old checkpoints saved as 'embeddings'
         model.teacher_embeddings.load_state_dict(state['embeddings'])
         print("Loaded embeddings (old format) into teacher_embeddings")
-    # Load infonce_logit_scale (adaptive temperature)
-    if 'infonce_logit_scale' in state:
-        model.infonce_logit_scale.data.copy_(state['infonce_logit_scale'])
-        print(f"Loaded infonce_logit_scale: {model.infonce_logit_scale.item():.4f}")
     # NOTE: Student (dismir.embeddings) are NOT loaded - remain randomly initialized
     print(f'Teacher weights loaded from {path}')
 
@@ -533,10 +535,7 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
     # Only optimise Teacher-related parameters (+ teacher_embeddings)
     teacher_params = (
         list(model.tokenizer.parameters()) +
-        list(model.partition_enhancer.parameters()) +
-        list(model.partition_enhancer_norm.parameters()) +
-        list(model.teacher_embeddings.parameters()) +
-        [model.infonce_logit_scale]  # CLIP-style adaptive temperature
+        list(model.teacher_embeddings.parameters())
     )
     optimizer = torch.optim.Adam(teacher_params, lr=lr,
                                  weight_decay=args.weight_decay)
@@ -552,7 +551,13 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
 
     try:
         iter_count = 0
-        for i, (users, targets, items, mask, times) in enumerate(train_data):
+        for i, batch in enumerate(train_data):
+            # [Multi-Target] Training batches have 6 elements; ignore future_labels here
+            # since forward_teacher_pretrain does not use them.
+            if len(batch) == 6:
+                users, targets, items, mask, times, _ = batch
+            else:
+                users, targets, items, mask, times = batch
             model.train()
             iter_count += 1
             optimizer.zero_grad()
@@ -576,9 +581,6 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                 avg = {k: v / loss_print_interval for k, v in loss_accumulators.items()}
                 print(f"[Pretrain-Teacher @ iter {iter_count}] "
                       f"recon: {avg.get('recon_loss', 0):.4f}, "
-                      f"infonce: {avg.get('infonce_loss', 0):.4f}, "
-                      f"temp: {avg.get('infonce_temp', 0):.4f}, "
-                      f"logit_scale: {avg.get('infonce_logit_scale', 0):.4f}, "
                       f"part: {avg.get('partition_loss', 0):.4f}, "
                       f"w_part: {avg.get('weighted_partition_loss', 0):.4f}, "
                       f"total: {avg.get('total_loss', 0):.4f}")
@@ -608,9 +610,9 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                 val_avg = {k: v / max(val_count, 1) for k, v in val_accumulators.items()}
                 val_recon_avg = val_avg.get('recon_loss', 0.0)
 
-                # ========== Teacher-specific Recall evaluation ==========
+                # ========== Teacher-specific Recall evaluation (Single Token) ==========
                 # During pretrain, Student is not trained, so we must use Teacher
-                # to generate tokens and compute recall against item embeddings
+                # to generate single token and compute recall against item embeddings
                 # NOTE: Use the same label for train and eval (first label only)
                 total_recall, total_ndcg, total_hitrate, total = 0.0, 0.0, 0, 0
 
@@ -628,51 +630,30 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                         # Both train and eval use the first label only
                         target_labels = [t[0] if isinstance(t, (list, tuple)) else t for t in v_targets]
 
-                        # Use Teacher to generate tokens (key: use label as target)
-                        tokens = model.encode_with_teacher(
+                        # Use Teacher to generate single token (recon_target)
+                        teacher_token = model.encode_with_teacher(
                             to_tensor(v_items, device),
                             to_tensor(target_labels, device),
                             to_tensor(v_mask, device),
                             device
-                        )  # (B, num_tokens, hidden_size)
+                        )  # (B, hidden_size) - single token
 
                         # Convert to numpy for faiss search
-                        tokens_np = tokens.cpu().numpy()  # (B, num_tokens, D)
-                        batch_size = tokens_np.shape[0]
-                        num_tokens = tokens_np.shape[1]
+                        token_np = teacher_token.cpu().numpy()  # (B, D)
 
-                        # Multi-interest evaluation: search with all tokens
-                        # Reshape to (B*num_tokens, D)
-                        tokens_flat = np.reshape(tokens_np, [-1, tokens_np.shape[-1]])
-                        D, I = gpu_index.search(tokens_flat, topN)  # D: distances, I: indices
+                        # Single token evaluation: direct search, no need to reshape
+                        D, I = gpu_index.search(token_np, topN)  # D: distances, I: indices
 
-                        # For each user, aggregate results from all tokens
+                        # For each user, evaluate against the single target label
                         # NOTE: Evaluate against the first label only (same as training)
                         for i, target_label in enumerate(target_labels):
                             recall = 0
                             dcg = 0.0
-                            item_list_set = set()
-
-                            # Combine results from all tokens for this user
-                            # I[i*num_tokens:(i+1)*num_tokens] gives topN for each token
-                            all_items = list(zip(
-                                np.reshape(I[i*num_tokens:(i+1)*num_tokens], -1),
-                                np.reshape(D[i*num_tokens:(i+1)*num_tokens], -1)
-                            ))
-                            # Sort by distance (inner product) descending
-                            all_items.sort(key=lambda x: x[1], reverse=True)
-
-                            # Select topN unique items
-                            for idx, (item_id, dist) in enumerate(all_items):
-                                if item_id not in item_list_set and item_id != 0:
-                                    item_list_set.add(item_id)
-                                    if len(item_list_set) >= topN:
-                                        break
 
                             # Calculate metrics against the single target label
-                            # Same as training: only care about the first label
+                            # I[i] gives topN items for user i
                             target_found = False
-                            for no, iid in enumerate(item_list_set):
+                            for no, iid in enumerate(I[i]):
                                 if iid == target_label:
                                     recall = 1  # Found the target
                                     dcg = 1.0 / math.log(no + 2, 2)
@@ -698,9 +679,6 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                 test_time = time.time()
                 print(f"[Pretrain-Teacher @ iter {iter_count}] "
                       f"val_recon: {val_avg.get('recon_loss', 0):.6f}, "
-                      f"val_infonce: {val_avg.get('infonce_loss', 0):.6f}, "
-                      f"val_temp: {val_avg.get('infonce_temp', 0):.4f}, "
-                      f"val_logit_scale: {val_avg.get('infonce_logit_scale', 0):.4f}, "
                       f"val_part: {val_avg.get('partition_loss', 0):.6f}, "
                       f"val_wpart: {val_avg.get('weighted_partition_loss', 0):.6f}, "
                       f"val_total: {val_avg.get('total_loss', 0):.6f}  "
