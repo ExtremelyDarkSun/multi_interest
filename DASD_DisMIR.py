@@ -953,7 +953,10 @@ class DASD_DisMIR(BasicModel):
         # 调用 tokenizer 生成 tokens 和 recon_target
         tokens, recon_target = self.tokenizer(label_eb, history_eb, mask)
 
-        return recon_target  # (batch_size, hidden_size) - 单token
+        # 归一化以匹配训练时的MSE loss（F.normalize）
+        recon_target = F.normalize(recon_target, dim=-1)
+
+        return recon_target  # (batch_size, hidden_size) - 单token（已归一化）
 
     def forward_teacher_pretrain(self, item_list, label_list, mask, times, device):
         """

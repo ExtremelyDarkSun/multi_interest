@@ -581,6 +581,7 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                 avg = {k: v / loss_print_interval for k, v in loss_accumulators.items()}
                 print(f"[Pretrain-Teacher @ iter {iter_count}] "
                       f"recon: {avg.get('recon_loss', 0):.4f}, "
+                      f"w_recon: {avg.get('weighted_recon_loss', 0):.4f}, "
                       f"part: {avg.get('partition_loss', 0):.4f}, "
                       f"w_part: {avg.get('weighted_partition_loss', 0):.4f}, "
                       f"total: {avg.get('total_loss', 0):.4f}")
@@ -618,7 +619,8 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
 
                 with torch.no_grad():
                     # Prepare faiss index using teacher embeddings (trained during pretrain)
-                    item_embs = model.teacher_embeddings.weight.cpu().numpy()
+                    # Normalize item embeddings to match recon_target (normalized in encode_with_teacher)
+                    item_embs = F.normalize(model.teacher_embeddings.weight, dim=-1).cpu().numpy()
                     res = faiss.StandardGpuResources()
                     flat_config = faiss.GpuIndexFlatConfig()
                     flat_config.device = device.index
@@ -679,6 +681,7 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                 test_time = time.time()
                 print(f"[Pretrain-Teacher @ iter {iter_count}] "
                       f"val_recon: {val_avg.get('recon_loss', 0):.6f}, "
+                      f"val_w_recon: {val_avg.get('weighted_recon_loss', 0):.6f}, "
                       f"val_part: {val_avg.get('partition_loss', 0):.6f}, "
                       f"val_wpart: {val_avg.get('weighted_partition_loss', 0):.6f}, "
                       f"val_total: {val_avg.get('total_loss', 0):.6f}  "
