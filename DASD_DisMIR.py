@@ -982,10 +982,12 @@ class DASD_DisMIR(BasicModel):
         )
 
         weighted_partition_loss = self.dismir.lambda_coef * partition_loss
-        total_loss = recon_loss + weighted_partition_loss
+        weighted_recon_loss = self.lambda_recon * recon_loss
+        total_loss = weighted_recon_loss + weighted_partition_loss
 
         loss_dict = {
             'recon_loss':   recon_loss.item(),
+            'weighted_recon_loss': weighted_recon_loss.item(),
             'partition_loss': partition_loss.item(),
             'weighted_partition_loss': weighted_partition_loss.item(),
             'total_loss':   total_loss.item(),
