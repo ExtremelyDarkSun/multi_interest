@@ -683,7 +683,7 @@ class DASD_DisMIR(BasicModel):
             num_heads=interest_num,
             dropout=pretrain_dropout,
             num_decoder_layers=num_decoder_layers,
-            num_embeddings=getattr(args, 'vq_num_embeddings', 256),
+            num_embeddings=getattr(args, 'vq_num_embeddings', 5000),
             vq_commitment_cost=getattr(args, 'vq_commitment_cost', 0.25),
         )
 
