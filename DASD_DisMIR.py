@@ -732,8 +732,10 @@ class DASD_DisMIR(BasicModel):
         )
 
         # 4. 动态选择蒸馏loss
+        # teacher_token 来自 teacher_embeddings，负样本也必须用同一张表，保证embedding空间一致
         select_loss, select_loss_dict = self.compute_dynamic_select_loss(
-            recon_target, interests  # (B, D) vs (B, K, D)
+            recon_target.detach(), interests,
+            embeddings=self.teacher_embeddings
         )
 
         # 5. DisMIR原有分区损失（可选）
@@ -826,17 +828,23 @@ class DASD_DisMIR(BasicModel):
 
         return bpr_loss
 
-    def compute_dynamic_select_loss(self, teacher_token, student_interests, neg_items=None):
+    def compute_dynamic_select_loss(self, teacher_token, student_interests, neg_items=None, embeddings=None):
         """
         动态选择蒸馏损失
         Args:
             teacher_token: (B, D) Teacher生成的target表示
             student_interests: (B, K, D) Student的多兴趣
             neg_items: (B, N) 负样本item ids（可选）
+            embeddings: 用于查找负样本的embedding表；应与teacher_token所在的embedding空间一致，
+                        即微调时传入 self.teacher_embeddings，确保正负样本在同一优化空间。
+                        默认回退到 self.dismir.embeddings（仅供兼容，不推荐）。
         Returns:
             loss: 组合loss (select_bpr_loss + uniformity_loss)
             loss_dict: 各分量
         """
+        if embeddings is None:
+            embeddings = self.dismir.embeddings
+
         B, K, D = student_interests.shape
 
         # Step 1: 计算Teacher token与K个interest的相似度
@@ -846,15 +854,19 @@ class DASD_DisMIR(BasicModel):
             dim=-1
         )  # (B, K)
 
-        # Step 2: 选择最相似的interest作为"正样本"
-        selected_idx = similarities.argmax(dim=-1)  # (B,)
-        selected_interest = student_interests[torch.arange(B), selected_idx]  # (B, D)
+        # Step 2: 用 Gumbel-Softmax 直通估计器选择最相似的interest（保留梯度）
+        # hard=True: 前向为 one-hot（等价于 argmax），反向为连续 softmax 梯度
+        # 梯度可以经由 selection_weights -> similarities -> student_interests 反传，
+        # 使选择逻辑本身可学习，解决原来 argmax 梯度断裂的问题
+        selection_weights = F.gumbel_softmax(similarities, tau=1.0, hard=True)  # (B, K) one-hot
+        selected_interest = (selection_weights.unsqueeze(-1) * student_interests).sum(dim=1)  # (B, D)
+        selected_idx = similarities.argmax(dim=-1)  # (B,) 仅用于统计，不参与梯度
 
         # Step 3: BPR Loss - selected_interest vs 负样本
-        # 获取负样本embeddings
+        # 负样本与正样本(teacher_token)使用同一张embedding表，保证在同一优化空间内比较
         if neg_items is None:
             neg_items = torch.randint(0, self.item_num, (B, self.dismir.num_negatives), device=teacher_token.device)
-        neg_eb = self.dismir.embeddings(neg_items)  # (B, N, D)
+        neg_eb = embeddings(neg_items)  # (B, N, D)
 
         # 正样本分数
         pos_score = (selected_interest * teacher_token).sum(dim=-1)  # (B,)
@@ -868,16 +880,16 @@ class DASD_DisMIR(BasicModel):
         diff = torch.clamp(diff, min=-20, max=20)
         select_bpr_loss = -F.logsigmoid(diff).mean(dim=-1).mean()  # scalar
 
-        # Step 4: 多样性正则（防止总是选同一个interest）
-        # 记录每个interest被选中的频率，鼓励均匀使用
-        select_dist = F.softmax(similarities, dim=-1).mean(dim=0)  # (K,)
-        uniformity_loss = -torch.sum(select_dist * torch.log(select_dist + 1e-9))
-
-        total_loss = select_bpr_loss + 0.01 * uniformity_loss
+        # Step 4: 多样性正则 —— 最大化选择熵，鼓励各 interest 被均匀使用
+        # selection_weights 是 one-hot，mean(dim=0) 为批次内各 interest 的实际被选频率
+        select_dist = selection_weights.mean(dim=0)  # (K,)
+        diversity_entropy = -torch.sum(select_dist * torch.log(select_dist + 1e-9))  # 熵 H（正数）
+        # 减去熵 = 最大化熵 = 鼓励均匀分布
+        total_loss = select_bpr_loss - 0.01 * diversity_entropy
 
         return total_loss, {
             'select_bpr_loss': select_bpr_loss.item(),
-            'uniformity_loss': uniformity_loss.item(),
+            'uniformity_loss': diversity_entropy.item(),
             'selected_interest_idx': selected_idx  # 用于分析
         }
 
@@ -978,22 +990,18 @@ class DASD_DisMIR(BasicModel):
             F.normalize(label_eb.detach(), dim=-1)
         )
 
-        # Partition loss using Teacher embeddings
-        deterministic_seed = 42 + item_list.sum().item() % 10000
-        partition_loss = self.compute_partition_loss_with_embeddings(
-            item_list, mask, self.teacher_embeddings, seed=deterministic_seed
-        )
-
-        weighted_partition_loss = self.dismir.lambda_coef * partition_loss
+        # partition_loss is excluded from Stage-1 pretraining.
+        # It has no tokenizer parameters in its computation graph, so it cannot
+        # improve reconstruction recall; it only destabilises teacher_embeddings
+        # and causes recall to collapse after the initial peak.
+        # partition_loss is re-introduced in Stage-2 joint training via DisMIR.
         weighted_recon_loss = self.lambda_recon * recon_loss
-        total_loss = weighted_recon_loss + weighted_partition_loss
+        total_loss = weighted_recon_loss
 
         loss_dict = {
-            'recon_loss':   recon_loss.item(),
-            'weighted_recon_loss': weighted_recon_loss.item(),
-            'partition_loss': partition_loss.item(),
-            'weighted_partition_loss': weighted_partition_loss.item(),
-            'total_loss':   total_loss.item(),
+            'recon_loss':            recon_loss.item(),
+            'weighted_recon_loss':   weighted_recon_loss.item(),
+            'total_loss':            total_loss.item(),
         }
         return total_loss, loss_dict
 

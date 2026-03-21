@@ -6,6 +6,7 @@ import faiss
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import os
 import signal
 
@@ -542,6 +543,7 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
 
     trials = 0
     best_val_loss = float('inf')
+    best_recall = 0.0  # Track best recall for checkpoint saving
     loss_print_interval = getattr(args, 'loss_print_interval', 100)
     loss_accumulators = {}
     start_time = time.time()
@@ -582,8 +584,6 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                 print(f"[Pretrain-Teacher @ iter {iter_count}] "
                       f"recon: {avg.get('recon_loss', 0):.4f}, "
                       f"w_recon: {avg.get('weighted_recon_loss', 0):.4f}, "
-                      f"part: {avg.get('partition_loss', 0):.4f}, "
-                      f"w_part: {avg.get('weighted_partition_loss', 0):.4f}, "
                       f"total: {avg.get('total_loss', 0):.4f}")
                 loss_accumulators = {}
 
@@ -679,25 +679,23 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                 # ========== End Teacher-specific evaluation ==========
 
                 test_time = time.time()
+                current_recall = metrics.get('recall', 0)
                 print(f"[Pretrain-Teacher @ iter {iter_count}] "
                       f"val_recon: {val_avg.get('recon_loss', 0):.6f}, "
                       f"val_w_recon: {val_avg.get('weighted_recon_loss', 0):.6f}, "
-                      f"val_part: {val_avg.get('partition_loss', 0):.6f}, "
-                      f"val_wpart: {val_avg.get('weighted_partition_loss', 0):.6f}, "
                       f"val_total: {val_avg.get('total_loss', 0):.6f}  "
-                      f"recall@{topN}: {metrics.get('recall', 0):.6f}, "
+                      f"recall@{topN}: {current_recall:.6f} {'★BEST' if current_recall > best_recall else ''}, "
                       f"ndcg@{topN}: {metrics.get('ndcg', 0):.6f}, "
                       f"hitrate@{topN}: {metrics.get('hitrate', 0):.6f}  "
                       f"time: {(test_time - start_time) / 60:.2f}min")
                 sys.stdout.flush()
 
-                # Save the LATEST checkpoint every validation (not best)
-                save_teacher_weights(model, teacher_model_path)
-                print(f"[Pretrain-Teacher] Latest checkpoint saved to {teacher_model_path}teacher.pt")
-
-                # Early stopping based on best validation loss (still track it)
-                if val_recon_avg < best_val_loss:
+                # Save checkpoint when recall improves (primary metric = reconstruction recall)
+                if current_recall > best_recall:
+                    best_recall = current_recall
                     best_val_loss = val_recon_avg
+                    save_teacher_weights(model, teacher_model_path)
+                    print(f"[Pretrain-Teacher] Best recall={best_recall:.6f}, checkpoint saved to {teacher_model_path}teacher.pt")
                     trials = 0
                 else:
                     trials += 1
@@ -712,8 +710,8 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
         print('-' * 99)
         print('[Pretrain-Teacher] Exiting from training early')
 
-    print(f"[Pretrain Stage-1] Done. Best val_recon={best_val_loss:.6f}")
-    print(f"[Pretrain Stage-1] Latest weights saved to {teacher_model_path}teacher.pt")
+    print(f"[Pretrain Stage-1] Done. Best recall={best_recall:.6f}, best val_recon={best_val_loss:.6f}")
+    print(f"[Pretrain Stage-1] Best weights saved to {teacher_model_path}teacher.pt")
 
 
 def output(device, dataset, model_type, item_count, batch_size, lr, seq_len,
