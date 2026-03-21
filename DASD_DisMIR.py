@@ -157,9 +157,6 @@ class HistoryEncoderLayer(nn.Module):
             norm_first=True  # Pre-norm结构，更稳定
         )
 
-        # 显式层归一化（用于残差连接后的归一化）
-        self.norm = nn.LayerNorm(hidden_size)
-
     def forward(self, x, mask=None):
         """
         Args:
@@ -168,18 +165,11 @@ class HistoryEncoderLayer(nn.Module):
         Returns:
             encoded: [batch_size, seq_len, hidden_size]
         """
-        residual = x
-
         # 处理mask: Transformer需要key_padding_mask (True=padding)
         key_pad_mask = (mask == 0) if mask is not None else None
 
-        # Transformer encoding (内部包含Self-Attn + FFN + Residual)
-        out = self.layer(x, src_key_padding_mask=key_pad_mask)
-
-        # 显式残差连接 + 层归一化（双重残差，便于梯度传播）
-        out = self.norm(out + residual)
-
-        return out
+        # Transformer encoding (内部已包含Self-Attn + FFN + Residual + LayerNorm)
+        return self.layer(x, src_key_padding_mask=key_pad_mask)
 
 
 class Qwen3NextRMSNorm(nn.Module):
@@ -655,18 +645,13 @@ class DASD_DisMIR(BasicModel):
         self.lambda_recon = getattr(args, 'lambda_recon', 0.1)       # teacher_mse 权重（预训练 & 微调）
         self.lambda_select = getattr(args, 'lambda_select', 1.0)     # select_bpr_loss 权重（微调）
         self.lambda_bpr = getattr(args, 'lambda_bpr', 1.0)           # dismir direct BPR loss 权重（微调）
-        self.lambda_embed_align = getattr(args, 'lambda_embed_align', 0.1)  # hard样本embedding对齐权重（微调）
         self.lambda_diversity = getattr(args, 'lambda_diversity', 0.01)  # 兴趣选择器熵正则权重（微调）
-        self.lambda_align = getattr(args, 'lambda_align', 0.1)
-        self.lambda_infonce = getattr(args, 'lambda_infonce', 0.1)
+        self.lambda_align = getattr(args, 'lambda_align', 0.1)       # ChamferLoss 对齐权重（微调）
         self.rlambda = getattr(args, 'rlambda', 0.0)
         # Teacher BPR loss 权重（默认1.0，与Student主loss地位相同）
         self.lambda_teacher_bpr = getattr(args, 'lambda_teacher_bpr', 1.0)
         # Teacher BPR 负样本数量，复用 Student 的 hard_neg_candidates
         self.teacher_neg_candidates = self.dismir.hard_neg_candidates
-
-        # InfoNCE温度参数（CLIP-style log自适应温度）
-        self.infonce_logit_scale = nn.Parameter(torch.ones(1) * np.log(1/0.07))
 
         # 保持DisMIR的name属性，用于evaluate函数中的模型识别
         self.name = 'DASD-DisMIR'
@@ -690,6 +675,14 @@ class DASD_DisMIR(BasicModel):
             num_decoder_layers=num_decoder_layers,
             num_embeddings=getattr(args, 'vq_num_embeddings', 256),
             vq_commitment_cost=getattr(args, 'vq_commitment_cost', 0.25),
+        )
+
+        # Token fusion: concat K tokens → project to D (用于 compute_dynamic_select_loss)
+        # 替代 mean pooling，保留多 token 的结构信息
+        self.token_fusion_proj = nn.Sequential(
+            nn.Linear(interest_num * hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size),
         )
 
         # DDPM 线性噪声调度
@@ -824,15 +817,8 @@ class DASD_DisMIR(BasicModel):
         select_bpr_weighted   = (select_bpr_per_sample * difficulty).mean()
         select_loss_weighted  = select_bpr_weighted - self.lambda_diversity * diversity_entropy
 
-        # [组件3] hard samples 的 embedding 对齐（teacher/student 选择不同兴趣的样本）
-        # 把正样本 embedding 拉向 recon_target（tokenizer 基于历史给出的 context-aware 重构）
-        pos_eb_align     = self.dismir.embeddings(label_list)                    # (B, D) 有梯度
-        embed_align      = 1 - F.cosine_similarity(
-            F.normalize(pos_eb_align, dim=-1),
-            F.normalize(recon_target.detach(), dim=-1),
-            dim=-1
-        )                                                                         # (B,) ∈ [0, 2]
-        embed_align_loss = (embed_align * hard_mask).mean()
+        # [组件3] ChamferLoss：强制 K 个 aspect token 与 K 个 student interest 双向对齐
+        chamfer_loss_val = self.chamfer_loss(quantized_tokens, interests)        # scalar
 
         # 5. DisMIR 分区损失（可选）
         partition_loss = 0.0
@@ -847,27 +833,27 @@ class DASD_DisMIR(BasicModel):
 
         # 7. 总Loss
         total_loss = (
-            self.lambda_bpr         * dismir_bpr +
-            self.lambda_select      * select_loss_weighted +
-            self.lambda_recon       * teacher_mse +
-            self.lambda_embed_align * embed_align_loss +
+            self.lambda_bpr    * dismir_bpr +
+            self.lambda_select * select_loss_weighted +
+            self.lambda_recon  * teacher_mse +
+            self.lambda_align  * chamfer_loss_val +
             self.dismir.lambda_coef * partition_loss +
-            self.rlambda            * atten_loss +
-            self.lambda_vq          * vq_loss
+            self.rlambda       * atten_loss +
+            self.lambda_vq     * vq_loss
         )
 
         # 8. 返回
         loss_dict = {
-            'dismir_bpr':       dismir_bpr.item(),
-            'select_bpr_loss':  select_loss_dict.get('select_bpr_loss', 0.0),
-            'uniformity_loss':  select_loss_dict.get('uniformity_loss', 0.0),
-            'teacher_mse':      teacher_mse.item(),
-            'index_agreement':  index_agreement.item(),
-            'embed_align_loss': embed_align_loss.item(),
-            'vq_loss':          vq_loss.item(),
-            'partition_loss':   partition_loss.item() if isinstance(partition_loss, torch.Tensor) else partition_loss,
-            'atten_loss':       atten_loss.item() if isinstance(atten_loss, torch.Tensor) else atten_loss,
-            'total_loss':       total_loss.item()
+            'dismir_bpr':      dismir_bpr.item(),
+            'select_bpr_loss': select_loss_dict.get('select_bpr_loss', 0.0),
+            'uniformity_loss': select_loss_dict.get('uniformity_loss', 0.0),
+            'teacher_mse':     teacher_mse.item(),
+            'index_agreement': index_agreement.item(),
+            'chamfer_loss':    chamfer_loss_val.item(),
+            'vq_loss':         vq_loss.item(),
+            'partition_loss':  partition_loss.item() if isinstance(partition_loss, torch.Tensor) else partition_loss,
+            'atten_loss':      atten_loss.item() if isinstance(atten_loss, torch.Tensor) else atten_loss,
+            'total_loss':      total_loss.item()
         }
 
         return interests, total_loss, loss_dict
@@ -945,9 +931,11 @@ class DASD_DisMIR(BasicModel):
         B, K, D = student_interests.shape
         device = student_interests.device
 
-        # Step 1: 计算 Teacher token 与 K 个 interest 的相似度（用 quantized_tokens 的均值作为 token 表示）
-        # 取 quantized_tokens 在 token 维度的均值作为整体 token 表示
-        token_repr = quantized_tokens.mean(dim=1)   # (B, D) — 聚合多 token
+        # Step 1: 计算 Teacher token 与 K 个 interest 的相似度
+        # 将 K 个 token concat 后经 MLP 投影为单向量，保留多 token 结构信息
+        token_repr = self.token_fusion_proj(
+            quantized_tokens.view(B, K * D)
+        )   # (B, K*D) → (B, D)
         similarities = F.cosine_similarity(
             token_repr.unsqueeze(1),  # (B, 1, D)
             student_interests,         # (B, K, D)
@@ -998,55 +986,6 @@ class DASD_DisMIR(BasicModel):
             'uniformity_loss': diversity_entropy.item(),
             'selected_interest_idx': selected_idx  # (B,) 用于计算索引一致率
         }
-
-    def calculate_infonce_loss(self, tokens, label_eb, base_temperature=0.07):
-        """
-        计算InfoNCE Loss (使用CLIP-style log自适应温度)
-
-        拉近同一target的tokens（多个）和对应label_emb的距离，
-        拉远与batch内其他label_emb的距离。
-
-        Args:
-            tokens: Teacher生成的tokens (batch_size, num_tokens, hidden_size)
-            label_eb: 目标物品嵌入 (batch_size, hidden_size)
-            base_temperature: 基础温度参数，默认0.07
-
-        Returns:
-            infonce_loss: InfoNCE损失值
-        """
-        batch_size, num_tokens, hidden_size = tokens.shape
-
-        # CLIP-style log自适应温度
-        # 限制logit_scale的范围防止极端值: [log(1/100), log(100)]
-        logit_scale = torch.clamp(self.infonce_logit_scale, min=np.log(1/100), max=np.log(100))
-        # effective_scale = exp(logit_scale), 温度 = base_temperature / effective_scale
-        # 或者直接: similarity * exp(logit_scale) / base_temperature
-        effective_scale = torch.exp(logit_scale)
-
-        # 归一化tokens和label_eb
-        tokens_norm = F.normalize(tokens, dim=-1)  # (batch_size, num_tokens, hidden_size)
-        label_eb_norm = F.normalize(label_eb, dim=-1)  # (batch_size, hidden_size)
-
-        # 计算相似度矩阵
-        tokens_flat = tokens_norm.view(batch_size * num_tokens, hidden_size)  # (batch_size * num_tokens, hidden_size)
-        label_eb_all = label_eb_norm  # (batch_size, hidden_size)
-
-        # 计算相似度: (batch_size * num_tokens, batch_size)
-        # 使用自适应scale: similarity * effective_scale / base_temperature
-        similarity = torch.matmul(tokens_flat, label_eb_all.t()) * effective_scale / base_temperature
-
-        # 创建标签：每个token对应的正样本是其所属样本的label
-        labels = torch.arange(batch_size, device=tokens.device).repeat_interleave(num_tokens)
-
-        # 计算InfoNCE loss (交叉熵)
-        infonce_loss = F.cross_entropy(similarity, labels)
-
-        # 监控温度值（训练时）
-        if self.training and batch_size % 100 == 0:  # 每隔一定batch打印
-            current_temp = base_temperature / effective_scale.item()
-            print(f"[InfoNCE] temp={current_temp:.4f}, logit_scale={logit_scale.item():.4f}")
-
-        return infonce_loss
 
     def encode_with_teacher(self, item_list, label_list, mask, device):
         """
