@@ -384,11 +384,17 @@ class Qwen3NextCrossAttention(nn.Module):
 
 
 class VectorQuantizer(nn.Module):
-    def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float = 0.25):
+    def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float = 0.25,
+                 revival_threshold: int = 1):
+        """
+        revival_threshold: codes used < threshold per batch will be reset to random input vectors.
+        Set to 0 to disable dead code revival.
+        """
         super().__init__()
-        self.embedding_dim   = embedding_dim
-        self.num_embeddings  = num_embeddings
-        self.commitment_cost = commitment_cost
+        self.embedding_dim      = embedding_dim
+        self.num_embeddings     = num_embeddings
+        self.commitment_cost    = commitment_cost
+        self.revival_threshold  = revival_threshold
         self.codebook = nn.Embedding(num_embeddings, embedding_dim)
         nn.init.uniform_(self.codebook.weight, -1.0 / num_embeddings, 1.0 / num_embeddings)
 
@@ -404,6 +410,19 @@ class VectorQuantizer(nn.Module):
         codebook_loss = F.mse_loss(q.detach(), flat)
         commit_loss   = F.mse_loss(q, flat.detach())
         vq_loss       = codebook_loss + self.commitment_cost * commit_loss
+
+        # Dead code revival: reset rarely-used codes to random input vectors
+        if self.training and self.revival_threshold > 0:
+            # Count usage for each code in this batch
+            usage = torch.zeros(self.num_embeddings, device=flat.device)
+            unique_idx, counts = idx.unique(return_counts=True)
+            usage[unique_idx] = counts.float()
+            dead_codes = (usage < self.revival_threshold).nonzero(as_tuple=True)[0]
+            if len(dead_codes) > 0:
+                n_dead = dead_codes.shape[0]
+                rand_idx = torch.randint(0, flat.shape[0], (n_dead,), device=flat.device)
+                with torch.no_grad():
+                    self.codebook.weight[dead_codes] = flat[rand_idx].detach()
 
         q_st = flat + (q - flat).detach()               # straight-through
         return q_st.view(B, K, D), vq_loss, idx.view(B, K)

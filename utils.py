@@ -96,18 +96,19 @@ def get_parser():
                         help='[DASD-DisMIR] Number of extra future-click targets for multi-target Teacher distillation (default: 2, total 3 targets)')
 
     # [DDPM noise] Forward diffusion noise schedule for Teacher input
-    parser.add_argument('--noise_T',          type=int,   default=40,
-                        help='[DASD-DisMIR] DDPM diffusion steps T (default: 40)')
-    parser.add_argument('--noise_beta_start', type=float, default=1e-4,
-                        help='[DASD-DisMIR] DDPM linear schedule beta_start (default: 1e-4)')
-    parser.add_argument('--noise_beta_end',   type=float, default=0.02,
-                        help='[DASD-DisMIR] DDPM linear schedule beta_end (default: 0.02)')
+    # Reduced defaults: VQ is the main anti-trivial bottleneck; aggressive noise hurts recall
+    parser.add_argument('--noise_T',          type=int,   default=20,
+                        help='[DASD-DisMIR] DDPM diffusion steps T (default: 20, reduced from 40)')
+    parser.add_argument('--noise_beta_start', type=float, default=0.0001,
+                        help='[DASD-DisMIR] DDPM linear schedule beta_start (default: 0.0001)')
+    parser.add_argument('--noise_beta_end',   type=float, default=0.001,
+                        help='[DASD-DisMIR] DDPM linear schedule beta_end (default: 0.001)')
 
     # [VQ-VAE] Vector quantization for multi-token discretization
     parser.add_argument('--lambda_vq',          type=float, default=0.1,
                         help='[DASD-DisMIR] VQ-VAE loss weight (default: 0.1)')
-    parser.add_argument('--vq_num_embeddings',  type=int,   default=256,
-                        help='[DASD-DisMIR] VQ codebook size (default: 256)')
+    parser.add_argument('--vq_num_embeddings',  type=int,   default=5000,
+                        help='[DASD-DisMIR] VQ codebook size (default: 5000)')
     parser.add_argument('--vq_commitment_cost', type=float, default=0.25,
                         help='[DASD-DisMIR] VQ commitment cost beta (default: 0.25)')
 

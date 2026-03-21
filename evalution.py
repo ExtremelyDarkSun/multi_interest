@@ -647,6 +647,8 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                     codebook_size = model.tokenizer.vq.num_embeddings
                     used_codes = set()  # 收集整个 valid 集上使用过的 codebook entry
 
+                    total_cosine = 0.0  # for avg recon cosine diagnostic
+                    num_cosine_batches = 0
                     for _, (v_users, v_targets, v_items, v_mask, v_times) in enumerate(valid_data):
                         target_labels = [t[0] if isinstance(t, (list, tuple)) else t for t in v_targets]
 
@@ -660,6 +662,14 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
 
                         # 收集 codebook indices
                         used_codes.update(vq_indices.cpu().numpy().flatten().tolist())
+
+                        # 计算平均重建余弦相似度（诊断 VQ 瓶颈是否过强）
+                        label_emb_norm = F.normalize(
+                            model.dismir.embeddings(to_tensor(target_labels, device)).detach(), dim=-1
+                        )  # (B, D)
+                        batch_cosine = (teacher_token * label_emb_norm).sum(dim=-1).mean().item()
+                        total_cosine += batch_cosine
+                        num_cosine_batches += 1
 
                         token_np = teacher_token.cpu().numpy()  # (B, D)
                         D, I = gpu_index.search(token_np, topN)
@@ -684,12 +694,16 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                 # codebook 利用率
                 codebook_utilization = len(used_codes) / codebook_size
 
+                # 平均重建余弦相似度（VQ 瓶颈质量诊断：越接近1.0越好）
+                avg_recon_cosine = total_cosine / max(num_cosine_batches, 1)
+
                 # Aggregate metrics
                 metrics = {
                     'recall': total_recall / total if total > 0 else 0,
                     'ndcg': total_ndcg / total if total > 0 else 0,
                     'hitrate': total_hitrate * 1.0 / total if total > 0 else 0,
                     'codebook_util': codebook_utilization,
+                    'recon_cosine': avg_recon_cosine,
                 }
                 # ========== End Teacher-specific evaluation ==========
 
@@ -703,7 +717,8 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                       f"ndcg@{topN}: {metrics.get('ndcg', 0):.6f}, "
                       f"hitrate@{topN}: {metrics.get('hitrate', 0):.6f}  |  "
                       f"codebook_util: {metrics.get('codebook_util', 0):.3f} "
-                      f"({int(metrics.get('codebook_util', 0) * codebook_size)}/{codebook_size})  |  "
+                      f"({int(metrics.get('codebook_util', 0) * codebook_size)}/{codebook_size})  "
+                      f"recon_cosine: {metrics.get('recon_cosine', 0):.4f}  |  "
                       f"time: {(test_time - start_time) / 60:.2f}min")
                 sys.stdout.flush()
 
