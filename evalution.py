@@ -591,6 +591,8 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                 print(f"[Pretrain-Teacher @ iter {iter_count}] "
                       f"recon: {avg.get('recon_loss', 0):.4f}, "
                       f"w_recon: {avg.get('weighted_recon_loss', 0):.4f}, "
+                      f"vq: {avg.get('vq_loss', 0):.4f}, "
+                      f"w_vq: {avg.get('weighted_vq_loss', 0):.4f}, "
                       f"total: {avg.get('total_loss', 0):.4f}")
                 loss_accumulators = {}
 
@@ -690,6 +692,8 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                 print(f"[Pretrain-Teacher @ iter {iter_count}] "
                       f"val_recon: {val_avg.get('recon_loss', 0):.6f}, "
                       f"val_w_recon: {val_avg.get('weighted_recon_loss', 0):.6f}, "
+                      f"val_vq: {val_avg.get('vq_loss', 0):.6f}, "
+                      f"val_w_vq: {val_avg.get('weighted_vq_loss', 0):.6f}, "
                       f"val_total: {val_avg.get('total_loss', 0):.6f}  "
                       f"recall@{topN}: {current_recall:.6f} {'★BEST' if current_recall > best_recall else ''}, "
                       f"ndcg@{topN}: {metrics.get('ndcg', 0):.6f}, "

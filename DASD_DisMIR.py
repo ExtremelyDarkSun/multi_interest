@@ -400,6 +400,32 @@ class Qwen3NextCrossAttention(nn.Module):
         return tokens, attn_weights
 
 
+class VectorQuantizer(nn.Module):
+    def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float = 0.25):
+        super().__init__()
+        self.embedding_dim   = embedding_dim
+        self.num_embeddings  = num_embeddings
+        self.commitment_cost = commitment_cost
+        self.codebook = nn.Embedding(num_embeddings, embedding_dim)
+        nn.init.uniform_(self.codebook.weight, -1.0 / num_embeddings, 1.0 / num_embeddings)
+
+    def forward(self, tokens):          # tokens: [B, K, D]
+        B, K, D = tokens.shape
+        flat = tokens.view(-1, D)       # [B*K, D]
+        dist = (flat.pow(2).sum(1, keepdim=True)
+                - 2.0 * flat @ self.codebook.weight.t()
+                + self.codebook.weight.pow(2).sum(1))   # [B*K, C]
+        idx  = dist.argmin(dim=1)                        # [B*K]
+        q    = self.codebook(idx)                        # [B*K, D]
+
+        codebook_loss = F.mse_loss(q.detach(), flat)
+        commit_loss   = F.mse_loss(q, flat.detach())
+        vq_loss       = codebook_loss + self.commitment_cost * commit_loss
+
+        q_st = flat + (q - flat).detach()               # straight-through
+        return q_st.view(B, K, D), vq_loss, idx.view(B, K)
+
+
 class ContextGatedTokenizer(nn.Module):
     """
     Context-Gated Aspect Tokenizer (Teacher模型) - 使用 Qwen3NextAttention
@@ -415,7 +441,8 @@ class ContextGatedTokenizer(nn.Module):
     """
 
     def __init__(self, hidden_size, num_tokens=4, num_heads=4, num_key_value_heads=None,
-                 dropout=0.1, num_decoder_layers=4, num_interaction_layers=1):
+                 dropout=0.1, num_decoder_layers=4, num_interaction_layers=1,
+                 num_embeddings=256, vq_commitment_cost=0.25):
         super(ContextGatedTokenizer, self).__init__()
         self.hidden_size = hidden_size
         self.num_tokens = num_tokens
@@ -492,6 +519,8 @@ class ContextGatedTokenizer(nn.Module):
         )
         # 可选：添加温度参数来控制softmax的锐利程度
         self.gate_temperature = nn.Parameter(torch.ones(1))
+
+        self.vq = VectorQuantizer(num_embeddings, hidden_size, vq_commitment_cost)
 
         self._reset_parameters()
 
@@ -573,13 +602,15 @@ class ContextGatedTokenizer(nn.Module):
         # 应用门控权重
         gated_tokens = tokens * gate_weights  # [B, num_tokens, hidden_size]
 
-        # Reconstruction
-        reconstructed = gated_tokens.sum(dim=1)  # [B, hidden_size]
+        # VQ 量化
+        quantized_tokens, vq_loss, _ = self.vq(gated_tokens)   # [B, K, D], scalar
+        reconstructed = quantized_tokens.sum(dim=1)             # [B, D]
 
         # 返回：
-        # - tokens: [batch_size, num_tokens, hidden_size]
+        # - quantized_tokens: [batch_size, num_tokens, hidden_size]
         # - reconstructed: [batch_size, hidden_size]
-        return tokens, reconstructed
+        # - vq_loss: scalar
+        return quantized_tokens, reconstructed, vq_loss
 
 
 # ============ 4. DASD_DisMIR 主类 ============
@@ -657,7 +688,19 @@ class DASD_DisMIR(BasicModel):
             num_heads=interest_num,
             dropout=pretrain_dropout,
             num_decoder_layers=num_decoder_layers,
+            num_embeddings=getattr(args, 'vq_num_embeddings', 256),
+            vq_commitment_cost=getattr(args, 'vq_commitment_cost', 0.25),
         )
+
+        # DDPM 线性噪声调度
+        noise_T          = getattr(args, 'noise_T',          40)
+        noise_beta_start = getattr(args, 'noise_beta_start', 1e-4)
+        noise_beta_end   = getattr(args, 'noise_beta_end',   0.02)
+        betas      = torch.linspace(noise_beta_start, noise_beta_end, noise_T)
+        alphas_bar = torch.cumprod(1.0 - betas, dim=0)
+        self.register_buffer('ddpm_alphas_bar', alphas_bar)
+        self.ddpm_T    = noise_T
+        self.lambda_vq = getattr(args, 'lambda_vq', 0.1)
 
         # 初始化TargetAwareFusion (目标感知融合层)
         # NOTE: 当前未使用，实际使用 dismir.read_out() 进行硬选择
@@ -676,6 +719,19 @@ class DASD_DisMIR(BasicModel):
                     param.requires_grad = False
 
         self.reset_parameters()
+
+    def _apply_ddpm_noise(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        DDPM 前向加噪：x_t = sqrt(ᾱ_t)*x + sqrt(1-ᾱ_t)*ε
+        t ~ Uniform[0, T)，每个 batch 元素独立采样
+        x 应已 detach（调用方负责）
+        """
+        B     = x.size(0)
+        t     = torch.randint(0, self.ddpm_T, (B,), device=x.device)
+        ab    = self.ddpm_alphas_bar[t].unsqueeze(-1)          # [B, 1]
+        eps   = torch.randn_like(x)
+        return ab.sqrt() * x + (1.0 - ab).sqrt() * eps        # [B, D]
+
     def forward(self, item_list, label_list, mask, times, device, train=True, future_labels=None):
         """
         前向传播 (Refactored for Dynamic Selection Distillation)
@@ -738,17 +794,23 @@ class DASD_DisMIR(BasicModel):
         history_eb = self.dismir.embeddings(item_list).detach()                  # (B, L, D)
         history_eb = history_eb * mask.unsqueeze(-1)
 
-        tokens, recon_target = self.tokenizer(label_eb, history_eb, mask)        # recon_target: (B, D)
+        # [改动] tokenizer 可训练时加噪；冻结时使用干净输入
+        tokenizer_trainable = any(p.requires_grad for p in self.tokenizer.parameters())
+        tokenizer_input = self._apply_ddpm_noise(label_eb) if (self.training and tokenizer_trainable) else label_eb
 
-        # 3. Teacher MSE loss
+        # [改动] 解包 3 值
+        quantized_tokens, recon_target, vq_loss = self.tokenizer(tokenizer_input, history_eb, mask)
+
+        # 3. Teacher MSE loss（recon_target 已是 quantized_tokens.sum(dim=1)）
         teacher_mse = F.mse_loss(
             F.normalize(recon_target, dim=-1),
             F.normalize(label_eb.detach(), dim=-1)
         )
 
         # 4. 动态选择蒸馏loss（返回 per-sample 数据供后续加权）
+        # [改动] 传入 quantized_tokens + label_eb（真实正样本）
         _, select_loss_dict = self.compute_dynamic_select_loss(
-            recon_target.detach(), interests
+            quantized_tokens, interests, label_eb
         )
 
         # 索引一致率 & hard mask
@@ -790,7 +852,8 @@ class DASD_DisMIR(BasicModel):
             self.lambda_recon       * teacher_mse +
             self.lambda_embed_align * embed_align_loss +
             self.dismir.lambda_coef * partition_loss +
-            self.rlambda            * atten_loss
+            self.rlambda            * atten_loss +
+            self.lambda_vq          * vq_loss
         )
 
         # 8. 返回
@@ -801,6 +864,7 @@ class DASD_DisMIR(BasicModel):
             'teacher_mse':      teacher_mse.item(),
             'index_agreement':  index_agreement.item(),
             'embed_align_loss': embed_align_loss.item(),
+            'vq_loss':          vq_loss.item(),
             'partition_loss':   partition_loss.item() if isinstance(partition_loss, torch.Tensor) else partition_loss,
             'atten_loss':       atten_loss.item() if isinstance(atten_loss, torch.Tensor) else atten_loss,
             'total_loss':       total_loss.item()
@@ -867,63 +931,64 @@ class DASD_DisMIR(BasicModel):
 
         return bpr_loss
 
-    def compute_dynamic_select_loss(self, teacher_token, student_interests):
+    def compute_dynamic_select_loss(self, quantized_tokens, student_interests, label_eb):
         """
         动态选择蒸馏损失
         Args:
-            teacher_token: (B, D) Teacher生成的target表示
-            student_interests: (B, K, D) Student的多兴趣
+            quantized_tokens: (B, K, D) Teacher 量化后的 token（用于难负样本挖掘）
+            student_interests: (B, K, D) Student 的多兴趣
+            label_eb: (B, D) 真实目标 item embedding（正样本）
         Returns:
             loss: 组合loss (select_bpr_loss + uniformity_loss)
             loss_dict: 各分量
         """
         B, K, D = student_interests.shape
+        device = student_interests.device
 
-        # Step 1: 计算Teacher token与K个interest的相似度
+        # Step 1: 计算 Teacher token 与 K 个 interest 的相似度（用 quantized_tokens 的均值作为 token 表示）
+        # 取 quantized_tokens 在 token 维度的均值作为整体 token 表示
+        token_repr = quantized_tokens.mean(dim=1)   # (B, D) — 聚合多 token
         similarities = F.cosine_similarity(
-            teacher_token.unsqueeze(1),  # (B, 1, D)
-            student_interests,            # (B, K, D)
+            token_repr.unsqueeze(1),  # (B, 1, D)
+            student_interests,         # (B, K, D)
             dim=-1
         )  # (B, K)
 
-        # Step 2: 用 Gumbel-Softmax 直通估计器选择最相似的interest（保留梯度）
-        # hard=True: 前向为 one-hot（等价于 argmax），反向为连续 softmax 梯度
-        # 梯度可以经由 selection_weights -> similarities -> student_interests 反传，
-        # 使选择逻辑本身可学习，解决原来 argmax 梯度断裂的问题
+        # Step 2: 用 Gumbel-Softmax 直通估计器选择最相似的 interest（保留梯度）
         selection_weights = F.gumbel_softmax(similarities, tau=1.0, hard=True)  # (B, K) one-hot
         selected_interest = (selection_weights.unsqueeze(-1) * student_interests).sum(dim=1)  # (B, D)
         selected_idx = similarities.argmax(dim=-1)  # (B,) 仅用于统计，不参与梯度
 
-        # Step 3: BPR Loss with shared hard negatives (matches dismir.compute_bpr_loss_with_hard_negative)
-        # 共享负样本：batch 内所有样本使用同一组随机负样本，与 DisMIR 保持一致
-        shared_neg = torch.randint(
-            0, self.item_num, (self.dismir.hard_neg_candidates,), device=teacher_token.device
-        )  # (N,)
-        shared_neg_eb = self.dismir.embeddings(shared_neg)  # (N, D)
+        # Step 3: [改动] 正样本使用真实 label_eb（修复 Improvement 3）
+        pos_score = (selected_interest * label_eb).sum(dim=-1)  # (B,)
 
-        # 正样本分数
-        pos_score = (selected_interest * teacher_token).sum(dim=-1)  # (B,)
+        # Step 4: [改动] Token 引导难负样本挖掘（Improvement 4）
+        H         = self.dismir.hard_neg_candidates
+        pool_size = H * K   # 候选池大小 = H * K
+        cand_ids  = torch.randint(0, self.item_num, (pool_size,), device=device)
+        cand_eb   = self.dismir.embeddings(cand_ids)              # [pool_size, D]
 
-        # 负样本分数
-        neg_scores = torch.matmul(selected_interest, shared_neg_eb.t())  # (B, N)
+        # 每个 token 在候选池中找最相似的 H 个 item（语义混淆负样本）
+        sim_tok_cand = torch.einsum('bkd,nd->bkn',
+                       F.normalize(quantized_tokens, dim=-1),
+                       F.normalize(cand_eb, dim=-1))              # [B, K, pool_size]
+        _, top_idx   = sim_tok_cand.topk(H, dim=-1)               # [B, K, H]
+        hard_neg_eb  = cand_eb[top_idx].view(B, K * H, D)         # [B, K*H, D]
 
-        # Hard loss：每个样本取最难负样本
-        hardest_neg, _ = neg_scores.max(dim=-1)  # (B,)
-        hard_diff = torch.clamp(pos_score - hardest_neg, min=-20, max=20)
-        hard_loss = -F.logsigmoid(hard_diff)  # (B,)
-
-        # All loss：对所有共享负样本取平均
-        all_diff = torch.clamp(pos_score.unsqueeze(1) - neg_scores, min=-20, max=20)  # (B, N)
-        all_loss = -F.logsigmoid(all_diff).mean(dim=-1)  # (B,)
+        # BPR：selected_interest vs K*H 个难负样本
+        neg_scores    = torch.einsum('bd,bnd->bn', selected_interest, hard_neg_eb)  # [B, K*H]
+        hardest_neg, _ = neg_scores.max(dim=-1)                   # [B,]
+        hard_diff      = torch.clamp(pos_score - hardest_neg, -20, 20)
+        hard_loss      = -F.logsigmoid(hard_diff)
+        all_diff       = torch.clamp(pos_score.unsqueeze(1) - neg_scores, -20, 20)
+        all_loss       = -F.logsigmoid(all_diff).mean(dim=-1)
 
         select_bpr_per_sample = hard_loss + all_loss  # (B,) 未 mean，供 forward() 加权使用
         select_bpr_loss = select_bpr_per_sample.mean()
 
-        # Step 4: 多样性正则 —— 最大化选择熵，鼓励各 interest 被均匀使用
-        # selection_weights 是 one-hot，mean(dim=0) 为批次内各 interest 的实际被选频率
+        # Step 5: 多样性正则 —— 最大化选择熵，鼓励各 interest 被均匀使用
         select_dist = selection_weights.mean(dim=0)  # (K,)
         diversity_entropy = -torch.sum(select_dist * torch.log(select_dist + 1e-9))  # 熵 H（正数，tensor）
-        # 减去熵 = 最大化熵 = 鼓励均匀分布
         total_loss = select_bpr_loss - self.lambda_diversity * diversity_entropy
 
         return total_loss, {
@@ -1004,7 +1069,7 @@ class DASD_DisMIR(BasicModel):
         history_eb = history_eb * mask.unsqueeze(-1)  # (batch_size, seq_len, hidden_size)
 
         # 调用 tokenizer 生成 tokens 和 recon_target
-        tokens, recon_target = self.tokenizer(label_eb, history_eb, mask)
+        quantized_tokens, recon_target, _vq_loss = self.tokenizer(label_eb, history_eb, mask)
 
         # 归一化以匹配训练时的MSE loss（F.normalize）
         recon_target = F.normalize(recon_target, dim=-1)
@@ -1017,13 +1082,16 @@ class DASD_DisMIR(BasicModel):
         MSE loss + Partition loss for better Teacher quality.
         """
         # 使用统一的 dismir.embeddings（pretrain阶段不detach history_eb，让tokenizer重构梯度训练embedding）
-        label_eb = self.dismir.embeddings(label_list).detach()  # (B, D)
-        history_eb = self.dismir.embeddings(item_list)          # (B, L, D)
+        label_eb   = self.dismir.embeddings(label_list).detach()  # (B, D)
+        history_eb = self.dismir.embeddings(item_list)            # (B, L, D)
         history_eb = history_eb * mask.unsqueeze(-1)
 
-        # Teacher forward
-        tokens, recon_target = self.tokenizer(label_eb, history_eb, mask)
-        # recon_target: (B, hidden_size) - 即sum_token
+        # [改动] 加噪（防平凡解：tokenizer 不能直接透传 label_eb）
+        noisy_label_eb = self._apply_ddpm_noise(label_eb)
+
+        # [改动] 解包 3 值
+        quantized_tokens, recon_target, vq_loss = self.tokenizer(noisy_label_eb, history_eb, mask)
+        # recon_target: (B, hidden_size) - quantized_tokens.sum(dim=1)
 
         # Reconstruction/MSE loss
         recon_loss = F.mse_loss(
@@ -1037,12 +1105,15 @@ class DASD_DisMIR(BasicModel):
         # and causes recall to collapse after the initial peak.
         # partition_loss is re-introduced in Stage-2 joint training via DisMIR.
         weighted_recon_loss = self.lambda_recon * recon_loss
-        total_loss = weighted_recon_loss
+        weighted_vq_loss    = self.lambda_vq    * vq_loss
+        total_loss          = weighted_recon_loss + weighted_vq_loss
 
         loss_dict = {
-            'recon_loss':            recon_loss.item(),
-            'weighted_recon_loss':   weighted_recon_loss.item(),
-            'total_loss':            total_loss.item(),
+            'recon_loss':          recon_loss.item(),
+            'weighted_recon_loss': weighted_recon_loss.item(),
+            'vq_loss':             vq_loss.item(),
+            'weighted_vq_loss':    weighted_vq_loss.item(),
+            'total_loss':          total_loss.item(),
         }
         return total_loss, loss_dict
 
