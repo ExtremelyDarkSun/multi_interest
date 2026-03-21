@@ -621,7 +621,9 @@ class DASD_DisMIR(BasicModel):
         self.dismir = dismir_model  # 原有的DisMIR模型（Student）
 
         # Loss权重（使用getattr确保兼容性，使用DASD调好的默认值）
-        self.lambda_recon = getattr(args, 'lambda_recon', 0.1)
+        self.lambda_recon = getattr(args, 'lambda_recon', 0.1)       # teacher_mse 权重（预训练 & 微调）
+        self.lambda_select = getattr(args, 'lambda_select', 1.0)     # select_bpr_loss 权重（微调）
+        self.lambda_diversity = getattr(args, 'lambda_diversity', 0.01)  # 兴趣选择器熵正则权重（微调）
         self.lambda_align = getattr(args, 'lambda_align', 0.1)
         self.lambda_infonce = getattr(args, 'lambda_infonce', 0.1)
         self.rlambda = getattr(args, 'rlambda', 0.0)
@@ -751,8 +753,8 @@ class DASD_DisMIR(BasicModel):
 
         # 7. 总Loss组合
         total_loss = (
-            select_loss +
-            teacher_mse +
+            self.lambda_select * select_loss +
+            self.lambda_recon * teacher_mse +
             self.dismir.lambda_coef * partition_loss +
             self.rlambda * atten_loss
         )
@@ -885,7 +887,7 @@ class DASD_DisMIR(BasicModel):
         select_dist = selection_weights.mean(dim=0)  # (K,)
         diversity_entropy = -torch.sum(select_dist * torch.log(select_dist + 1e-9))  # 熵 H（正数）
         # 减去熵 = 最大化熵 = 鼓励均匀分布
-        total_loss = select_bpr_loss - 0.01 * diversity_entropy
+        total_loss = select_bpr_loss - self.lambda_diversity * diversity_entropy
 
         return total_loss, {
             'select_bpr_loss': select_bpr_loss.item(),
