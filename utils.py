@@ -75,6 +75,8 @@ def get_parser():
                         help='[DASD-DisMIR] Teacher MSE reconstruction loss weight (pretrain & finetune), default 0.1')
     parser.add_argument('--lambda_select', type=float, default=1.0,
                         help='[DASD-DisMIR] Select BPR distillation loss weight (finetune only), default 1.0')
+    parser.add_argument('--lambda_bpr', type=float, default=1.0,
+                        help='[DASD-DisMIR] DisMIR direct recommendation BPR loss weight (finetune floor signal), default 1.0')
     parser.add_argument('--lambda_diversity', type=float, default=0.01,
                         help='[DASD-DisMIR] Diversity entropy loss weight for interest selector (finetune only), default 0.01')
     parser.add_argument('--lambda_align', type=float, default=0.1,

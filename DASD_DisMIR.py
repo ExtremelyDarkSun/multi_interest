@@ -623,6 +623,7 @@ class DASD_DisMIR(BasicModel):
         # Loss权重（使用getattr确保兼容性，使用DASD调好的默认值）
         self.lambda_recon = getattr(args, 'lambda_recon', 0.1)       # teacher_mse 权重（预训练 & 微调）
         self.lambda_select = getattr(args, 'lambda_select', 1.0)     # select_bpr_loss 权重（微调）
+        self.lambda_bpr = getattr(args, 'lambda_bpr', 1.0)           # dismir direct BPR loss 权重（微调）
         self.lambda_diversity = getattr(args, 'lambda_diversity', 0.01)  # 兴趣选择器熵正则权重（微调）
         self.lambda_align = getattr(args, 'lambda_align', 0.1)
         self.lambda_infonce = getattr(args, 'lambda_infonce', 0.1)
@@ -664,19 +665,14 @@ class DASD_DisMIR(BasicModel):
         # Loss模块 (ChamferLoss deprecated, kept for compatibility but not used)
         self.chamfer_loss = ChamferLoss()
 
-        # Teacher 专用 embedding（从预训练权重加载）
-        self.teacher_embeddings = nn.Embedding(self.dismir.item_num, hidden_size)
-        # 默认初始化为与 student 相同的值（可选，便于热启动）
-        with torch.no_grad():
-            self.teacher_embeddings.weight.copy_(self.dismir.embeddings.weight)
-
         # Training phase control: 'pretrain' or 'finetune'
         self.training_phase = getattr(args, 'training_phase', 'finetune')
 
-        # Pretrain阶段冻结Student相关组件
+        # Pretrain阶段冻结Student相关组件（shared embedding保持可训练）
         if self.training_phase == 'pretrain':
-            for param in self.dismir.parameters():
-                param.requires_grad = False
+            for name, param in self.dismir.named_parameters():
+                if 'embeddings' not in name:
+                    param.requires_grad = False
 
         self.reset_parameters()
     def forward(self, item_list, label_list, mask, times, device, train=True, future_labels=None):
@@ -717,10 +713,15 @@ class DASD_DisMIR(BasicModel):
         # DisMIR forward返回: (interests, scores, atten, readout, selection)
         interests, scores, atten, readout, selection = dismir_output
 
-        # 2. Teacher前向传播（继续微调）
-        # 获取target和历史序列的嵌入（Teacher使用独立的teacher_embeddings）
-        label_eb = self.teacher_embeddings(label_list).detach()  # (batch_size, hidden_size)
-        history_eb = self.teacher_embeddings(item_list)  # (batch_size, seq_len, hidden_size)
+        # 2a. DisMIR直接推荐信号（防止finetune收敛到DisMIR以下）
+        dismir_bpr = self.dismir.compute_bpr_loss_with_hard_negative(
+            readout, label_list, self.dismir.hard_neg_candidates
+        )
+
+        # 2b. Teacher前向传播（继续微调）
+        # 使用统一的 dismir.embeddings；detach 防止tokenizer重构梯度与推荐梯度在共享表上冲突
+        label_eb = self.dismir.embeddings(label_list).detach()  # (batch_size, hidden_size)
+        history_eb = self.dismir.embeddings(item_list).detach()  # (batch_size, seq_len, hidden_size)
         history_eb = history_eb * mask.unsqueeze(-1)  # (batch_size, seq_len, hidden_size)
 
         # Tokenizer生成tokens和重构target
@@ -734,10 +735,8 @@ class DASD_DisMIR(BasicModel):
         )
 
         # 4. 动态选择蒸馏loss
-        # teacher_token 来自 teacher_embeddings，负样本也必须用同一张表，保证embedding空间一致
         select_loss, select_loss_dict = self.compute_dynamic_select_loss(
-            recon_target.detach(), interests,
-            embeddings=self.teacher_embeddings
+            recon_target.detach(), interests
         )
 
         # 5. DisMIR原有分区损失（可选）
@@ -753,14 +752,16 @@ class DASD_DisMIR(BasicModel):
 
         # 7. 总Loss组合
         total_loss = (
+            self.lambda_bpr    * dismir_bpr +
             self.lambda_select * select_loss +
-            self.lambda_recon * teacher_mse +
+            self.lambda_recon  * teacher_mse +
             self.dismir.lambda_coef * partition_loss +
             self.rlambda * atten_loss
         )
 
         # 8. 返回结果和Loss详情
         loss_dict = {
+            'dismir_bpr': dismir_bpr.item() if isinstance(dismir_bpr, torch.Tensor) else dismir_bpr,
             'select_bpr_loss': select_loss_dict.get('select_bpr_loss', 0.0),
             'uniformity_loss': select_loss_dict.get('uniformity_loss', 0.0),
             'teacher_mse': teacher_mse.item() if isinstance(teacher_mse, torch.Tensor) else teacher_mse,
@@ -798,8 +799,8 @@ class DASD_DisMIR(BasicModel):
         # 复用 BasicModel.read_out，它只依赖 user_eb / label_eb，不涉及参数
         teacher_readout, _ = self.dismir.read_out(tokens, label_eb)  # (B, D)
 
-        # Step 2: 正样本 embedding（用 teacher_embeddings）
-        pos_eb = self.teacher_embeddings(pos_items)       # (B, D)
+        # Step 2: 正样本 embedding（用统一的 dismir.embeddings）
+        pos_eb = self.dismir.embeddings(pos_items)        # (B, D)
         pos_scores = (teacher_readout * pos_eb).sum(-1)   # (B,)
 
         # Step 3: 采样共享负样本（与 Student 完全相同：batch 内共享，随机均匀采样）
@@ -808,7 +809,7 @@ class DASD_DisMIR(BasicModel):
             (self.teacher_neg_candidates,),
             device=teacher_readout.device
         )  # (N,)
-        shared_neg_eb = self.teacher_embeddings(shared_neg)                       # (N, D)
+        shared_neg_eb = self.dismir.embeddings(shared_neg)                        # (N, D)
         shared_neg_scores = torch.matmul(teacher_readout, shared_neg_eb.t())      # (B, N)
 
         # Step 4: Hard loss —— 每个样本取最难负样本
@@ -830,23 +831,16 @@ class DASD_DisMIR(BasicModel):
 
         return bpr_loss
 
-    def compute_dynamic_select_loss(self, teacher_token, student_interests, neg_items=None, embeddings=None):
+    def compute_dynamic_select_loss(self, teacher_token, student_interests):
         """
         动态选择蒸馏损失
         Args:
             teacher_token: (B, D) Teacher生成的target表示
             student_interests: (B, K, D) Student的多兴趣
-            neg_items: (B, N) 负样本item ids（可选）
-            embeddings: 用于查找负样本的embedding表；应与teacher_token所在的embedding空间一致，
-                        即微调时传入 self.teacher_embeddings，确保正负样本在同一优化空间。
-                        默认回退到 self.dismir.embeddings（仅供兼容，不推荐）。
         Returns:
             loss: 组合loss (select_bpr_loss + uniformity_loss)
             loss_dict: 各分量
         """
-        if embeddings is None:
-            embeddings = self.dismir.embeddings
-
         B, K, D = student_interests.shape
 
         # Step 1: 计算Teacher token与K个interest的相似度
@@ -864,23 +858,29 @@ class DASD_DisMIR(BasicModel):
         selected_interest = (selection_weights.unsqueeze(-1) * student_interests).sum(dim=1)  # (B, D)
         selected_idx = similarities.argmax(dim=-1)  # (B,) 仅用于统计，不参与梯度
 
-        # Step 3: BPR Loss - selected_interest vs 负样本
-        # 负样本与正样本(teacher_token)使用同一张embedding表，保证在同一优化空间内比较
-        if neg_items is None:
-            neg_items = torch.randint(0, self.item_num, (B, self.dismir.num_negatives), device=teacher_token.device)
-        neg_eb = embeddings(neg_items)  # (B, N, D)
+        # Step 3: BPR Loss with shared hard negatives (matches dismir.compute_bpr_loss_with_hard_negative)
+        # 共享负样本：batch 内所有样本使用同一组随机负样本，与 DisMIR 保持一致
+        shared_neg = torch.randint(
+            0, self.item_num, (self.dismir.hard_neg_candidates,), device=teacher_token.device
+        )  # (N,)
+        shared_neg_eb = self.dismir.embeddings(shared_neg)  # (N, D)
 
         # 正样本分数
         pos_score = (selected_interest * teacher_token).sum(dim=-1)  # (B,)
 
         # 负样本分数
-        neg_score = torch.matmul(selected_interest.unsqueeze(1), neg_eb.transpose(-2, -1)).squeeze(1)  # (B, N)
+        neg_scores = torch.matmul(selected_interest, shared_neg_eb.t())  # (B, N)
 
-        # BPR loss
-        pos_score_expanded = pos_score.unsqueeze(1)  # (B, 1)
-        diff = pos_score_expanded - neg_score  # (B, N)
-        diff = torch.clamp(diff, min=-20, max=20)
-        select_bpr_loss = -F.logsigmoid(diff).mean(dim=-1).mean()  # scalar
+        # Hard loss：每个样本取最难负样本
+        hardest_neg, _ = neg_scores.max(dim=-1)  # (B,)
+        hard_diff = torch.clamp(pos_score - hardest_neg, min=-20, max=20)
+        hard_loss = -F.logsigmoid(hard_diff)  # (B,)
+
+        # All loss：对所有共享负样本取平均
+        all_diff = torch.clamp(pos_score.unsqueeze(1) - neg_scores, min=-20, max=20)  # (B, N)
+        all_loss = -F.logsigmoid(all_diff).mean(dim=-1)  # (B,)
+
+        select_bpr_loss = (hard_loss + all_loss).mean()
 
         # Step 4: 多样性正则 —— 最大化选择熵，鼓励各 interest 被均匀使用
         # selection_weights 是 one-hot，mean(dim=0) 为批次内各 interest 的实际被选频率
@@ -959,9 +959,9 @@ class DASD_DisMIR(BasicModel):
         Returns:
             recon_target: (batch_size, hidden_size) - Teacher 生成的 target 表示 (单token)
         """
-        # 获取 label 和 history 的 embedding（Teacher使用独立的teacher_embeddings）
-        label_eb = self.teacher_embeddings(label_list).detach()  # (batch_size, hidden_size)
-        history_eb = self.teacher_embeddings(item_list)  # (batch_size, seq_len, hidden_size)
+        # 获取 label 和 history 的 embedding（使用统一的 dismir.embeddings）
+        label_eb = self.dismir.embeddings(label_list).detach()  # (batch_size, hidden_size)
+        history_eb = self.dismir.embeddings(item_list)  # (batch_size, seq_len, hidden_size)
         history_eb = history_eb * mask.unsqueeze(-1)  # (batch_size, seq_len, hidden_size)
 
         # 调用 tokenizer 生成 tokens 和 recon_target
@@ -977,9 +977,9 @@ class DASD_DisMIR(BasicModel):
         Stage-1 Teacher-only forward pass (Simplified).
         MSE loss + Partition loss for better Teacher quality.
         """
-        # Teacher使用独立的teacher_embeddings
-        label_eb = self.teacher_embeddings(label_list).detach()       # (B, D)
-        history_eb = self.teacher_embeddings(item_list)      # (B, L, D)
+        # 使用统一的 dismir.embeddings（pretrain阶段不detach history_eb，让tokenizer重构梯度训练embedding）
+        label_eb = self.dismir.embeddings(label_list).detach()  # (B, D)
+        history_eb = self.dismir.embeddings(item_list)          # (B, L, D)
         history_eb = history_eb * mask.unsqueeze(-1)
 
         # Teacher forward
