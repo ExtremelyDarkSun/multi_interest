@@ -19,52 +19,45 @@ class ChamferLoss(nn.Module):
     2. Backward Matching: 每个兴趣向量都应该对应某个Token（防止生成无意义兴趣）
     """
 
-    def __init__(self):
+    def __init__(self, alpha_t_to_i: float = 0.3):
+        """
+        Args:
+            alpha_t_to_i: token→interest 方向的权重（小于1），
+                          interest→token 方向权重固定为1.0。
+                          设计动机：不强求所有 token 被 interest 全覆盖，
+                          但每个 interest 必须能在 token 集合中找到对应。
+        """
         super(ChamferLoss, self).__init__()
+        self.alpha_t_to_i = alpha_t_to_i
 
     def forward(self, tokens, interests):
         """
-        计算双向Chamfer Distance
+        非对称双向 Chamfer Distance
 
         Args:
-            tokens: Teacher生成的Token集合 (batch_size, K, hidden_size)
-            interests: Student生成的兴趣向量集合 (batch_size, M, hidden_size)
+            tokens:    Teacher 生成的 token 集合  (B, K, D)
+            interests: Student 生成的兴趣向量集合 (B, M, D)
 
         Returns:
-            loss: 双向对齐损失（标量）
+            loss: 标量
         """
-        # 计算距离矩阵
-        # dist_matrix: (batch_size, K, M)
-        # 使用L2距离（p=2）
-
-        tokens = F.normalize(tokens, p=2, dim=-1)#.detach()  # L2归一化
+        tokens    = F.normalize(tokens,    p=2, dim=-1)
         interests = F.normalize(interests, p=2, dim=-1)
 
+        # dist_matrix: (B, K, M)，K=token数，M=interest数
         dist_matrix = torch.cdist(tokens, interests, p=2)
 
-        # # [Original] Full Chamfer: 所有token和所有interest互相拉近
-        # # Forward Matching: 每个token找最近的interest
-        # # 确保每个Token都能被某个兴趣向量覆盖
-        # min_dist_t_to_i, _ = dist_matrix.min(dim=2)  # (batch_size, K)
-        # loss_t_to_i = min_dist_t_to_i.mean()
-        #
-        # # Backward Matching: 每个interest找最近的token
-        # # 确保每个兴趣向量都有对应的Token（防止生成无意义的兴趣）
-        # min_dist_i_to_t, _ = dist_matrix.min(dim=1)  # (batch_size, M)
-        # loss_i_to_t = min_dist_i_to_t.mean()
-        #
-        # # 总损失为两个方向损失之和
-        # total_loss = loss_t_to_i + loss_i_to_t
+        # interest→token（主方向）：每个 interest 找最近的 token
+        # min over K(token) → (B, M)
+        min_i_to_t, _ = dist_matrix.min(dim=1)   # (B, M)
+        loss_i_to_t   = min_i_to_t.mean()
 
-        # [Top-K Chamfer] 只拉近最近的两对 (token, interest) 之间的距离
-        # Step 1: 从 dist_matrix (B, K, M) 展平成 (B, K*M)，找全局最小的两个距离
-        B, K, M = dist_matrix.shape
-        dist_flat = dist_matrix.view(B, K * M)                 # (B, K*M)
-        # 取最小的 2 个距离（即最近的两对匹配）
-        top2_dist, _ = dist_flat.topk(4, dim=1, largest=False) # (B, 2)
-        total_loss = top2_dist.mean()
+        # token→interest（次方向，小权重）：每个 token 找最近的 interest
+        # min over M(interest) → (B, K)
+        min_t_to_i, _ = dist_matrix.min(dim=2)   # (B, K)
+        loss_t_to_i   = min_t_to_i.mean()
 
-        return total_loss
+        return loss_i_to_t + self.alpha_t_to_i * loss_t_to_i
 
 
 
@@ -643,16 +636,9 @@ class DASD_DisMIR(BasicModel):
 
         # Loss权重（使用getattr确保兼容性，使用DASD调好的默认值）
         self.lambda_recon = getattr(args, 'lambda_recon', 0.1)       # teacher_mse 权重（预训练 & 微调）
-        self.lambda_select = getattr(args, 'lambda_select', 1.0)     # select_bpr_loss 权重（微调）
-        self.lambda_bpr = getattr(args, 'lambda_bpr', 1.0)           # dismir direct BPR loss 权重（微调）
-        self.lambda_diversity = getattr(args, 'lambda_diversity', 0.01)  # 兴趣选择器熵正则权重（微调）
-        self.lambda_align = getattr(args, 'lambda_align', 0.1)       # ChamferLoss 对齐权重（微调）
+        self.lambda_bpr   = getattr(args, 'lambda_bpr',   1.0)   # DisMIR BPR loss 权重
+        self.lambda_align = getattr(args, 'lambda_align', 0.1)  # ChamferLoss 对齐权重
         self.rlambda = getattr(args, 'rlambda', 0.0)
-        # Teacher BPR loss 权重（默认1.0，与Student主loss地位相同）
-        self.lambda_teacher_bpr = getattr(args, 'lambda_teacher_bpr', 1.0)
-        # Teacher BPR 负样本数量，复用 Student 的 hard_neg_candidates
-        self.teacher_neg_candidates = self.dismir.hard_neg_candidates
-
         # 保持DisMIR的name属性，用于evaluate函数中的模型识别
         self.name = 'DASD-DisMIR'
 
@@ -675,14 +661,6 @@ class DASD_DisMIR(BasicModel):
             num_decoder_layers=num_decoder_layers,
             num_embeddings=getattr(args, 'vq_num_embeddings', 256),
             vq_commitment_cost=getattr(args, 'vq_commitment_cost', 0.25),
-        )
-
-        # Token fusion: concat K tokens → project to D (用于 compute_dynamic_select_loss)
-        # 替代 mean pooling，保留多 token 的结构信息
-        self.token_fusion_proj = nn.Sequential(
-            nn.Linear(interest_num * hidden_size, hidden_size),
-            nn.GELU(),
-            nn.Linear(hidden_size, hidden_size),
         )
 
         # DDPM 线性噪声调度
@@ -750,242 +728,100 @@ class DASD_DisMIR(BasicModel):
         if train and self.training_phase == 'pretrain':
             return self.forward_teacher_pretrain(item_list, label_list, mask, times, device)
 
-        # === Finetune Phase: Joint training with dynamic selection ===
+        # === Finetune Phase: Student + Teacher 联合训练 ===
 
-        # 1. Student前向传播
+        # 1. Student 前向
         dismir_output = self.dismir(item_list, label_list, mask, times, device, train=train)
 
         if not train:
-            # 推理时直接返回DisMIR的输出
             return dismir_output[0], None
 
-        # 训练模式：解包DisMIR输出
-        # DisMIR forward返回: (interests, scores, atten, readout, selection)
+        # DisMIR forward 返回: (interests, scores, atten, readout, selection)
         interests, scores, atten, readout, selection = dismir_output
-
-        # 2a. DisMIR BPR — 内联计算以获得 per-sample losses（用于难度加权）
         B = label_list.shape[0]
-        pos_eb_bpr       = self.dismir.embeddings(label_list)                     # (B, D)
-        pos_scores_bpr   = (readout * pos_eb_bpr).sum(dim=-1)                    # (B,)
-        shared_neg       = torch.randint(0, self.item_num,
-                                         (self.dismir.hard_neg_candidates,),
-                                         device=device)
-        shared_neg_eb    = self.dismir.embeddings(shared_neg)                     # (N, D)
-        shared_neg_sc    = torch.matmul(readout, shared_neg_eb.t())               # (B, N)
-        hardest_neg, _   = shared_neg_sc.max(dim=-1)                             # (B,)
-        hard_diff_bpr    = torch.clamp(pos_scores_bpr - hardest_neg, -20, 20)
-        all_diff_bpr     = torch.clamp(pos_scores_bpr.unsqueeze(1) - shared_neg_sc, -20, 20)
-        bpr_per_sample   = (-F.logsigmoid(hard_diff_bpr)
-                            + (-F.logsigmoid(all_diff_bpr).mean(dim=-1)))        # (B,)
-        dismir_bpr       = bpr_per_sample.mean()
 
-        # 难度权重：BPR 越高的样本权重越大（soft，均值≈1）
-        difficulty = F.softmax(bpr_per_sample.detach(), dim=0) * B               # (B,)
-
-        # 2b. Teacher前向传播（tokenizer 在 --pretrain 2 时已冻结）
-        label_eb   = self.dismir.embeddings(label_list).detach()                 # (B, D)
-        history_eb = self.dismir.embeddings(item_list).detach()                  # (B, L, D)
+        # 2. Teacher 前向（Stage-2 tokenizer 可训练，始终加噪）
+        label_eb   = self.dismir.embeddings(label_list).detach()   # (B, D)
+        history_eb = self.dismir.embeddings(item_list).detach()    # (B, L, D)
         history_eb = history_eb * mask.unsqueeze(-1)
 
-        # [改动] tokenizer 可训练时加噪；冻结时使用干净输入
-        tokenizer_trainable = any(p.requires_grad for p in self.tokenizer.parameters())
-        tokenizer_input = self._apply_ddpm_noise(label_eb) if (self.training and tokenizer_trainable) else label_eb
+        tokenizer_input = self._apply_ddpm_noise(label_eb) if self.training else label_eb
+        quantized_tokens, recon_target, vq_loss = self.tokenizer(
+            tokenizer_input, history_eb, mask
+        )   # quantized_tokens: (B, K, D)
+        K = quantized_tokens.shape[1]
 
-        # [改动] 解包 3 值
-        quantized_tokens, recon_target, vq_loss = self.tokenizer(tokenizer_input, history_eb, mask)
-
-        # 3. Teacher MSE loss（recon_target 已是 quantized_tokens.sum(dim=1)）
+        # 3. Teacher MSE loss（约束 tokenizer 重构目标物品）
         teacher_mse = F.mse_loss(
             F.normalize(recon_target, dim=-1),
-            F.normalize(label_eb.detach(), dim=-1)
+            F.normalize(label_eb, dim=-1)
         )
 
-        # 4. 动态选择蒸馏loss（返回 per-sample 数据供后续加权）
-        # [改动] 传入 quantized_tokens + label_eb（真实正样本）
-        _, select_loss_dict = self.compute_dynamic_select_loss(
-            quantized_tokens, interests, label_eb
-        )
+        # 4. DisMIR BPR（teacher token 检索困难负样本）
+        pos_eb     = self.dismir.embeddings(label_list)            # (B, D) 有梯度
+        pos_scores = (readout * pos_eb).sum(dim=-1)                # (B,)
 
-        # 索引一致率 & hard mask
-        teacher_idx     = select_loss_dict['selected_interest_idx']              # (B,)
-        index_agreement = (teacher_idx == selection).float().mean()              # ∈ [0, 1]
-        hard_mask       = (teacher_idx != selection).float()                     # (B,) 1=不一致
+        # Teacher token 在候选池中找语义最相似的 H 个 item 作为难负样本
+        H         = self.dismir.hard_neg_candidates
+        pool_size = H * K
+        cand_ids  = torch.randint(0, self.item_num, (pool_size,), device=device)
+        cand_eb   = self.dismir.embeddings(cand_ids)               # (pool_size, D)
 
-        # [组件2] 难度加权的 select_bpr（BPR 越难的样本权重越大）
-        select_bpr_per_sample = select_loss_dict['select_bpr_per_sample']        # (B,)
-        diversity_entropy     = select_loss_dict['diversity_entropy']            # tensor
-        select_bpr_weighted   = (select_bpr_per_sample * difficulty).mean()
-        select_loss_weighted  = select_bpr_weighted - self.lambda_diversity * diversity_entropy
+        with torch.no_grad():
+            sim_tok_cand = torch.einsum(
+                'bkd,nd->bkn',
+                F.normalize(quantized_tokens, dim=-1),
+                F.normalize(cand_eb, dim=-1)
+            )   # (B, K, pool_size)
+            _, top_idx = sim_tok_cand.topk(H, dim=-1)              # (B, K, H)
 
-        # [组件3] ChamferLoss：强制 K 个 aspect token 与 K 个 student interest 双向对齐
-        chamfer_loss_val = self.chamfer_loss(quantized_tokens, interests)        # scalar
+        hard_neg_eb    = cand_eb[top_idx].view(B, K * H, -1)       # (B, K*H, D)
+        neg_scores     = torch.einsum('bd,bnd->bn', readout, hard_neg_eb)  # (B, K*H)
+        hardest_neg, _ = neg_scores.max(dim=-1)                    # (B,)
+        hard_diff      = torch.clamp(pos_scores - hardest_neg, -20, 20)
+        hard_loss      = -F.logsigmoid(hard_diff)                  # (B,)
+        all_diff       = torch.clamp(pos_scores.unsqueeze(1) - neg_scores, -20, 20)
+        all_loss       = -F.logsigmoid(all_diff).mean(dim=-1)      # (B,)
+        dismir_bpr     = (hard_loss + all_loss).mean()
 
-        # 5. DisMIR 分区损失（可选）
+        # 5. ChamferLoss：aspect token 集合 ↔ student interest 集合
+        chamfer_loss_val = self.chamfer_loss(quantized_tokens, interests)
+
+        # 6. DisMIR 分区损失（可选）
         partition_loss = 0.0
         if hasattr(self.dismir, 'lambda_coef') and self.dismir.lambda_coef > 0:
             deterministic_seed = 42 + item_list.sum().item() % 10000
-            partition_loss = self.dismir.compute_partition_loss(item_list, mask, seed=deterministic_seed)
+            partition_loss = self.dismir.compute_partition_loss(
+                item_list, mask, seed=deterministic_seed
+            )
 
-        # 6. 路由正则化（可选）
+        # 7. 路由正则化（可选）
         atten_loss = 0.0
         if atten is not None and self.rlambda > 0:
             atten_loss = self.dismir.calculate_atten_loss(atten)
 
-        # 7. 总Loss
+        # 8. 总 Loss
         total_loss = (
-            self.lambda_bpr    * dismir_bpr +
-            self.lambda_select * select_loss_weighted +
-            self.lambda_recon  * teacher_mse +
-            self.lambda_align  * chamfer_loss_val +
+            self.lambda_bpr   * dismir_bpr +
+            self.lambda_recon * teacher_mse +
+            self.lambda_align * chamfer_loss_val +
             self.dismir.lambda_coef * partition_loss +
-            self.rlambda       * atten_loss +
-            self.lambda_vq     * vq_loss
+            self.rlambda      * atten_loss +
+            self.lambda_vq    * vq_loss
         )
 
-        # 8. 返回
         loss_dict = {
-            'dismir_bpr':      dismir_bpr.item(),
-            'select_bpr_loss': select_loss_dict.get('select_bpr_loss', 0.0),
-            'uniformity_loss': select_loss_dict.get('uniformity_loss', 0.0),
-            'teacher_mse':     teacher_mse.item(),
-            'index_agreement': index_agreement.item(),
-            'chamfer_loss':    chamfer_loss_val.item(),
-            'vq_loss':         vq_loss.item(),
-            'partition_loss':  partition_loss.item() if isinstance(partition_loss, torch.Tensor) else partition_loss,
-            'atten_loss':      atten_loss.item() if isinstance(atten_loss, torch.Tensor) else atten_loss,
-            'total_loss':      total_loss.item()
+            'dismir_bpr':    dismir_bpr.item(),
+            'teacher_mse':   teacher_mse.item(),
+            'chamfer_loss':  chamfer_loss_val.item(),
+            'vq_loss':       vq_loss.item(),
+            'partition_loss': partition_loss.item() if isinstance(partition_loss, torch.Tensor) else partition_loss,
+            'atten_loss':    atten_loss.item() if isinstance(atten_loss, torch.Tensor) else atten_loss,
+            'total_loss':    total_loss.item(),
         }
 
         return interests, total_loss, loss_dict
 
-    def compute_teacher_bpr_loss(self, tokens, label_eb, pos_items):
-        """
-        用与 Student 完全相同的 BPR with hard negative 方法计算 Teacher 的主推荐损失。
-
-        流程：
-          1. 用 read_out 从 tokens (B, M, D) 中选出与 label_eb 最近的单个 token
-             作为 Teacher 的用户表示 teacher_readout (B, D)
-          2. 以 teacher_embeddings 为 item 表示，随机采样 neg_candidates 个负样本
-             （batch 内共享，与 Student 相同策略）
-          3. Hard loss：对每个样本取最难负样本（得分最高）
-          4. All loss：对所有共享负样本取平均
-          5. total = hard_loss + all_loss
-
-        Args:
-            tokens:    Teacher 生成的 tokens  (batch_size, num_tokens, hidden_size)
-            label_eb:  目标物品 embedding     (batch_size, hidden_size)
-                       已由 teacher_embeddings 查表，用于 read_out 选 token
-            pos_items: 目标物品 id            (batch_size,)
-                       用于查 teacher_embeddings 得到正样本 embedding
-
-        Returns:
-            bpr_loss: scalar tensor
-        """
-        # Step 1: read_out —— 从 tokens 中选出与 label_eb 最近的那个 token
-        # 复用 BasicModel.read_out，它只依赖 user_eb / label_eb，不涉及参数
-        teacher_readout, _ = self.dismir.read_out(tokens, label_eb)  # (B, D)
-
-        # Step 2: 正样本 embedding（用统一的 dismir.embeddings）
-        pos_eb = self.dismir.embeddings(pos_items)        # (B, D)
-        pos_scores = (teacher_readout * pos_eb).sum(-1)   # (B,)
-
-        # Step 3: 采样共享负样本（与 Student 完全相同：batch 内共享，随机均匀采样）
-        shared_neg = torch.randint(
-            0, self.dismir.item_num,
-            (self.teacher_neg_candidates,),
-            device=teacher_readout.device
-        )  # (N,)
-        shared_neg_eb = self.dismir.embeddings(shared_neg)                        # (N, D)
-        shared_neg_scores = torch.matmul(teacher_readout, shared_neg_eb.t())      # (B, N)
-
-        # Step 4: Hard loss —— 每个样本取最难负样本
-        hardest_neg_scores, _ = shared_neg_scores.max(dim=-1)                    # (B,)
-        hard_diff = torch.clamp(pos_scores - hardest_neg_scores, min=-20, max=20)
-        hard_loss = -F.logsigmoid(hard_diff)                                      # (B,)
-
-        # Step 5: All loss —— 所有共享负样本平均
-        all_diff = torch.clamp(
-            pos_scores.unsqueeze(1) - shared_neg_scores, min=-20, max=20
-        )  # (B, N)
-        all_loss = -F.logsigmoid(all_diff).mean(dim=-1)                          # (B,)
-
-        bpr_loss = (hard_loss + all_loss).mean()
-
-        if torch.isnan(bpr_loss):
-            print("[Teacher BPR Warning] loss is NaN, returning 0")
-            return torch.tensor(0.0, device=teacher_readout.device)
-
-        return bpr_loss
-
-    def compute_dynamic_select_loss(self, quantized_tokens, student_interests, label_eb):
-        """
-        动态选择蒸馏损失
-        Args:
-            quantized_tokens: (B, K, D) Teacher 量化后的 token（用于难负样本挖掘）
-            student_interests: (B, K, D) Student 的多兴趣
-            label_eb: (B, D) 真实目标 item embedding（正样本）
-        Returns:
-            loss: 组合loss (select_bpr_loss + uniformity_loss)
-            loss_dict: 各分量
-        """
-        B, K, D = student_interests.shape
-        device = student_interests.device
-
-        # Step 1: 计算 Teacher token 与 K 个 interest 的相似度
-        # 将 K 个 token concat 后经 MLP 投影为单向量，保留多 token 结构信息
-        token_repr = self.token_fusion_proj(
-            quantized_tokens.view(B, K * D)
-        )   # (B, K*D) → (B, D)
-        similarities = F.cosine_similarity(
-            token_repr.unsqueeze(1),  # (B, 1, D)
-            student_interests,         # (B, K, D)
-            dim=-1
-        )  # (B, K)
-
-        # Step 2: 用 Gumbel-Softmax 直通估计器选择最相似的 interest（保留梯度）
-        selection_weights = F.gumbel_softmax(similarities, tau=1.0, hard=True)  # (B, K) one-hot
-        selected_interest = (selection_weights.unsqueeze(-1) * student_interests).sum(dim=1)  # (B, D)
-        selected_idx = similarities.argmax(dim=-1)  # (B,) 仅用于统计，不参与梯度
-
-        # Step 3: [改动] 正样本使用真实 label_eb（修复 Improvement 3）
-        pos_score = (selected_interest * label_eb).sum(dim=-1)  # (B,)
-
-        # Step 4: [改动] Token 引导难负样本挖掘（Improvement 4）
-        H         = self.dismir.hard_neg_candidates
-        pool_size = H * K   # 候选池大小 = H * K
-        cand_ids  = torch.randint(0, self.item_num, (pool_size,), device=device)
-        cand_eb   = self.dismir.embeddings(cand_ids)              # [pool_size, D]
-
-        # 每个 token 在候选池中找最相似的 H 个 item（语义混淆负样本）
-        sim_tok_cand = torch.einsum('bkd,nd->bkn',
-                       F.normalize(quantized_tokens, dim=-1),
-                       F.normalize(cand_eb, dim=-1))              # [B, K, pool_size]
-        _, top_idx   = sim_tok_cand.topk(H, dim=-1)               # [B, K, H]
-        hard_neg_eb  = cand_eb[top_idx].view(B, K * H, D)         # [B, K*H, D]
-
-        # BPR：selected_interest vs K*H 个难负样本
-        neg_scores    = torch.einsum('bd,bnd->bn', selected_interest, hard_neg_eb)  # [B, K*H]
-        hardest_neg, _ = neg_scores.max(dim=-1)                   # [B,]
-        hard_diff      = torch.clamp(pos_score - hardest_neg, -20, 20)
-        hard_loss      = -F.logsigmoid(hard_diff)
-        all_diff       = torch.clamp(pos_score.unsqueeze(1) - neg_scores, -20, 20)
-        all_loss       = -F.logsigmoid(all_diff).mean(dim=-1)
-
-        select_bpr_per_sample = hard_loss + all_loss  # (B,) 未 mean，供 forward() 加权使用
-        select_bpr_loss = select_bpr_per_sample.mean()
-
-        # Step 5: 多样性正则 —— 最大化选择熵，鼓励各 interest 被均匀使用
-        select_dist = selection_weights.mean(dim=0)  # (K,)
-        diversity_entropy = -torch.sum(select_dist * torch.log(select_dist + 1e-9))  # 熵 H（正数，tensor）
-        total_loss = select_bpr_loss - self.lambda_diversity * diversity_entropy
-
-        return total_loss, {
-            'select_bpr_loss': select_bpr_loss.item(),
-            'select_bpr_per_sample': select_bpr_per_sample,  # (B,) tensor，供难度加权
-            'diversity_entropy': diversity_entropy,           # tensor，供 forward() 重组 loss
-            'uniformity_loss': diversity_entropy.item(),
-            'selected_interest_idx': selected_idx  # (B,) 用于计算索引一致率
-        }
 
     def encode_with_teacher(self, item_list, label_list, mask, device):
         """

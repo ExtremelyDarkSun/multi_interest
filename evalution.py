@@ -242,18 +242,28 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
         load_teacher_weights(model, teacher_model_path)
         print(f"[Pretrain Stage-2] Teacher weights loaded from {teacher_model_path}; proceeding with joint training")
 
-        # 冻结 tokenizer，student 继续正常训练
-        for param in model.tokenizer.parameters():
-            param.requires_grad = False
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in model.parameters())
-        print(f"[Finetune] Tokenizer frozen. Trainable: {trainable}/{total} params")
-
     loss_fn = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=lr, weight_decay=args.weight_decay
-    )
+
+    # Stage-2：tokenizer 使用小学习率微调，其余参数使用默认 lr
+    if model_type == "DASD-DisMIR" and getattr(args, 'pretrain', 0) == 2:
+        tokenizer_lr_ratio = getattr(args, 'tokenizer_lr_ratio', 0.1)
+        tok_ids    = set(id(p) for p in model.tokenizer.parameters())
+        tok_params = list(model.tokenizer.parameters())
+        other_params = [p for p in model.parameters()
+                        if p.requires_grad and id(p) not in tok_ids]
+        optimizer = torch.optim.Adam([
+            {'params': other_params, 'lr': lr},
+            {'params': tok_params,   'lr': lr * tokenizer_lr_ratio},
+        ], weight_decay=args.weight_decay)
+        total     = sum(p.numel() for p in model.parameters())
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"[Stage-2] tokenizer lr={lr * tokenizer_lr_ratio:.2e}, "
+              f"others lr={lr:.2e}, trainable={trainable}/{total} params")
+    else:
+        optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=lr, weight_decay=args.weight_decay
+        )
 
     trials = 0
 
@@ -385,11 +395,9 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
                     avg_losses = {k: v/loss_print_interval for k, v in loss_accumulators.items()}
                     print(f"[DASD-DisMIR Loss Details @ iter {iter}] "
                           f"dismir_bpr: {avg_losses.get('dismir_bpr', 0):.4f}, "
-                          f"select_bpr: {avg_losses.get('select_bpr_loss', 0):.4f}, "
-                          f"chamfer: {avg_losses.get('chamfer_loss', 0):.4f}, "
                           f"teacher_mse: {avg_losses.get('teacher_mse', 0):.4f}, "
-                          f"idx_agree: {avg_losses.get('index_agreement', 0):.4f}, "
-                          f"uniformity: {avg_losses.get('uniformity_loss', 0):.4f}, "
+                          f"chamfer: {avg_losses.get('chamfer_loss', 0):.4f}, "
+                          f"vq: {avg_losses.get('vq_loss', 0):.4f}, "
                           f"partition: {avg_losses.get('partition_loss', 0):.4f}, "
                           f"atten: {avg_losses.get('atten_loss', 0):.4f}, "
                           f"total: {avg_losses.get('total_loss', 0):.4f}")

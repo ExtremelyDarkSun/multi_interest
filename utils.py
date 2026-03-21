@@ -76,23 +76,11 @@ def get_parser():
     parser.add_argument('--lambda_select', type=float, default=1.0,
                         help='[DASD-DisMIR] Select BPR distillation loss weight (finetune only), default 1.0')
     parser.add_argument('--lambda_bpr', type=float, default=1.0,
-                        help='[DASD-DisMIR] DisMIR direct recommendation BPR loss weight (finetune floor signal), default 1.0')
-    parser.add_argument('--lambda_embed_align', type=float, default=0.1,
-                        help='[DASD-DisMIR] Hard-sample embedding alignment loss weight (pulls pos_eb toward recon_target for teacher/student disagreement samples), default 0.1')
-    parser.add_argument('--lambda_diversity', type=float, default=0.01,
-                        help='[DASD-DisMIR] Diversity entropy loss weight for interest selector (finetune only), default 0.01')
+                        help='[DASD-DisMIR] DisMIR BPR loss weight, default 1.0')
     parser.add_argument('--lambda_align', type=float, default=0.1,
-                        help='[DASD-DisMIR] Alignment (Chamfer) loss weight [DASD_REF] default 0.1')
-    parser.add_argument('--lambda_infonce', type=float, default=0.1,
-                        help='[DASD-DisMIR] InfoNCE contrastive loss weight [DASD_REF] default 0.1')
-
-    # [Partition-Aware DASD-DisMIR] Partition enhancement hyperparameters
-    parser.add_argument('--lambda_partition_align', type=float, default=0.3,
-                        help='[Partition-Aware DASD-DisMIR] Partition alignment loss weight, default 0.3')
-    parser.add_argument('--partition_temperature', type=float, default=0.5,
-                        help='[Partition-Aware DASD-DisMIR] Temperature for partition enhancement (<1 for sharper), default 0.5')
-    parser.add_argument('--partition_align_temperature', type=float, default=1.0,
-                        help='[Partition-Aware DASD-DisMIR] Temperature for partition alignment, default 1.0')
+                        help='[DASD-DisMIR] ChamferLoss (token↔interest) weight, default 0.1')
+    parser.add_argument('--tokenizer_lr_ratio', type=float, default=0.1,
+                        help='[DASD-DisMIR Stage-2] tokenizer lr = lr * tokenizer_lr_ratio, default 0.1')
 
     # [Teacher Pretrain] Two-stage training for DASD-DisMIR
     # 0: joint training (default, original behaviour)
