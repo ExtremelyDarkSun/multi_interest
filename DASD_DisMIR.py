@@ -624,6 +624,7 @@ class DASD_DisMIR(BasicModel):
         self.lambda_recon = getattr(args, 'lambda_recon', 0.1)       # teacher_mse 权重（预训练 & 微调）
         self.lambda_select = getattr(args, 'lambda_select', 1.0)     # select_bpr_loss 权重（微调）
         self.lambda_bpr = getattr(args, 'lambda_bpr', 1.0)           # dismir direct BPR loss 权重（微调）
+        self.lambda_embed_align = getattr(args, 'lambda_embed_align', 0.1)  # hard样本embedding对齐权重（微调）
         self.lambda_diversity = getattr(args, 'lambda_diversity', 0.01)  # 兴趣选择器熵正则权重（微调）
         self.lambda_align = getattr(args, 'lambda_align', 0.1)
         self.lambda_infonce = getattr(args, 'lambda_infonce', 0.1)
@@ -713,61 +714,96 @@ class DASD_DisMIR(BasicModel):
         # DisMIR forward返回: (interests, scores, atten, readout, selection)
         interests, scores, atten, readout, selection = dismir_output
 
-        # 2a. DisMIR直接推荐信号（防止finetune收敛到DisMIR以下）
-        dismir_bpr = self.dismir.compute_bpr_loss_with_hard_negative(
-            readout, label_list, self.dismir.hard_neg_candidates
-        )
+        # 2a. DisMIR BPR — 内联计算以获得 per-sample losses（用于难度加权）
+        B = label_list.shape[0]
+        pos_eb_bpr       = self.dismir.embeddings(label_list)                     # (B, D)
+        pos_scores_bpr   = (readout * pos_eb_bpr).sum(dim=-1)                    # (B,)
+        shared_neg       = torch.randint(0, self.item_num,
+                                         (self.dismir.hard_neg_candidates,),
+                                         device=device)
+        shared_neg_eb    = self.dismir.embeddings(shared_neg)                     # (N, D)
+        shared_neg_sc    = torch.matmul(readout, shared_neg_eb.t())               # (B, N)
+        hardest_neg, _   = shared_neg_sc.max(dim=-1)                             # (B,)
+        hard_diff_bpr    = torch.clamp(pos_scores_bpr - hardest_neg, -20, 20)
+        all_diff_bpr     = torch.clamp(pos_scores_bpr.unsqueeze(1) - shared_neg_sc, -20, 20)
+        bpr_per_sample   = (-F.logsigmoid(hard_diff_bpr)
+                            + (-F.logsigmoid(all_diff_bpr).mean(dim=-1)))        # (B,)
+        dismir_bpr       = bpr_per_sample.mean()
 
-        # 2b. Teacher前向传播（继续微调）
-        # 使用统一的 dismir.embeddings；detach 防止tokenizer重构梯度与推荐梯度在共享表上冲突
-        label_eb = self.dismir.embeddings(label_list).detach()  # (batch_size, hidden_size)
-        history_eb = self.dismir.embeddings(item_list).detach()  # (batch_size, seq_len, hidden_size)
-        history_eb = history_eb * mask.unsqueeze(-1)  # (batch_size, seq_len, hidden_size)
+        # 难度权重：BPR 越高的样本权重越大（soft，均值≈1）
+        difficulty = F.softmax(bpr_per_sample.detach(), dim=0) * B               # (B,)
 
-        # Tokenizer生成tokens和重构target
-        tokens, recon_target = self.tokenizer(label_eb, history_eb, mask)
-        # recon_target: (B, D) - 作为单token使用
+        # 2b. Teacher前向传播（tokenizer 在 --pretrain 2 时已冻结）
+        label_eb   = self.dismir.embeddings(label_list).detach()                 # (B, D)
+        history_eb = self.dismir.embeddings(item_list).detach()                  # (B, L, D)
+        history_eb = history_eb * mask.unsqueeze(-1)
 
-        # 3. Teacher自己的MSE loss（保留，继续微调）
+        tokens, recon_target = self.tokenizer(label_eb, history_eb, mask)        # recon_target: (B, D)
+
+        # 3. Teacher MSE loss
         teacher_mse = F.mse_loss(
             F.normalize(recon_target, dim=-1),
             F.normalize(label_eb.detach(), dim=-1)
         )
 
-        # 4. 动态选择蒸馏loss
-        select_loss, select_loss_dict = self.compute_dynamic_select_loss(
+        # 4. 动态选择蒸馏loss（返回 per-sample 数据供后续加权）
+        _, select_loss_dict = self.compute_dynamic_select_loss(
             recon_target.detach(), interests
         )
 
-        # 5. DisMIR原有分区损失（可选）
+        # 索引一致率 & hard mask
+        teacher_idx     = select_loss_dict['selected_interest_idx']              # (B,)
+        index_agreement = (teacher_idx == selection).float().mean()              # ∈ [0, 1]
+        hard_mask       = (teacher_idx != selection).float()                     # (B,) 1=不一致
+
+        # [组件2] 难度加权的 select_bpr（BPR 越难的样本权重越大）
+        select_bpr_per_sample = select_loss_dict['select_bpr_per_sample']        # (B,)
+        diversity_entropy     = select_loss_dict['diversity_entropy']            # tensor
+        select_bpr_weighted   = (select_bpr_per_sample * difficulty).mean()
+        select_loss_weighted  = select_bpr_weighted - self.lambda_diversity * diversity_entropy
+
+        # [组件3] hard samples 的 embedding 对齐（teacher/student 选择不同兴趣的样本）
+        # 把正样本 embedding 拉向 recon_target（tokenizer 基于历史给出的 context-aware 重构）
+        pos_eb_align     = self.dismir.embeddings(label_list)                    # (B, D) 有梯度
+        embed_align      = 1 - F.cosine_similarity(
+            F.normalize(pos_eb_align, dim=-1),
+            F.normalize(recon_target.detach(), dim=-1),
+            dim=-1
+        )                                                                         # (B,) ∈ [0, 2]
+        embed_align_loss = (embed_align * hard_mask).mean()
+
+        # 5. DisMIR 分区损失（可选）
         partition_loss = 0.0
         if hasattr(self.dismir, 'lambda_coef') and self.dismir.lambda_coef > 0:
             deterministic_seed = 42 + item_list.sum().item() % 10000
             partition_loss = self.dismir.compute_partition_loss(item_list, mask, seed=deterministic_seed)
 
-        # 6. DisMIR原有路由正则化损失（可选）
+        # 6. 路由正则化（可选）
         atten_loss = 0.0
         if atten is not None and self.rlambda > 0:
             atten_loss = self.dismir.calculate_atten_loss(atten)
 
-        # 7. 总Loss组合
+        # 7. 总Loss
         total_loss = (
-            self.lambda_bpr    * dismir_bpr +
-            self.lambda_select * select_loss +
-            self.lambda_recon  * teacher_mse +
+            self.lambda_bpr         * dismir_bpr +
+            self.lambda_select      * select_loss_weighted +
+            self.lambda_recon       * teacher_mse +
+            self.lambda_embed_align * embed_align_loss +
             self.dismir.lambda_coef * partition_loss +
-            self.rlambda * atten_loss
+            self.rlambda            * atten_loss
         )
 
-        # 8. 返回结果和Loss详情
+        # 8. 返回
         loss_dict = {
-            'dismir_bpr': dismir_bpr.item() if isinstance(dismir_bpr, torch.Tensor) else dismir_bpr,
-            'select_bpr_loss': select_loss_dict.get('select_bpr_loss', 0.0),
-            'uniformity_loss': select_loss_dict.get('uniformity_loss', 0.0),
-            'teacher_mse': teacher_mse.item() if isinstance(teacher_mse, torch.Tensor) else teacher_mse,
-            'partition_loss': partition_loss.item() if isinstance(partition_loss, torch.Tensor) else partition_loss,
-            'atten_loss': atten_loss.item() if isinstance(atten_loss, torch.Tensor) else atten_loss,
-            'total_loss': total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss
+            'dismir_bpr':       dismir_bpr.item(),
+            'select_bpr_loss':  select_loss_dict.get('select_bpr_loss', 0.0),
+            'uniformity_loss':  select_loss_dict.get('uniformity_loss', 0.0),
+            'teacher_mse':      teacher_mse.item(),
+            'index_agreement':  index_agreement.item(),
+            'embed_align_loss': embed_align_loss.item(),
+            'partition_loss':   partition_loss.item() if isinstance(partition_loss, torch.Tensor) else partition_loss,
+            'atten_loss':       atten_loss.item() if isinstance(atten_loss, torch.Tensor) else atten_loss,
+            'total_loss':       total_loss.item()
         }
 
         return interests, total_loss, loss_dict
@@ -880,19 +916,22 @@ class DASD_DisMIR(BasicModel):
         all_diff = torch.clamp(pos_score.unsqueeze(1) - neg_scores, min=-20, max=20)  # (B, N)
         all_loss = -F.logsigmoid(all_diff).mean(dim=-1)  # (B,)
 
-        select_bpr_loss = (hard_loss + all_loss).mean()
+        select_bpr_per_sample = hard_loss + all_loss  # (B,) 未 mean，供 forward() 加权使用
+        select_bpr_loss = select_bpr_per_sample.mean()
 
         # Step 4: 多样性正则 —— 最大化选择熵，鼓励各 interest 被均匀使用
         # selection_weights 是 one-hot，mean(dim=0) 为批次内各 interest 的实际被选频率
         select_dist = selection_weights.mean(dim=0)  # (K,)
-        diversity_entropy = -torch.sum(select_dist * torch.log(select_dist + 1e-9))  # 熵 H（正数）
+        diversity_entropy = -torch.sum(select_dist * torch.log(select_dist + 1e-9))  # 熵 H（正数，tensor）
         # 减去熵 = 最大化熵 = 鼓励均匀分布
         total_loss = select_bpr_loss - self.lambda_diversity * diversity_entropy
 
         return total_loss, {
             'select_bpr_loss': select_bpr_loss.item(),
+            'select_bpr_per_sample': select_bpr_per_sample,  # (B,) tensor，供难度加权
+            'diversity_entropy': diversity_entropy,           # tensor，供 forward() 重组 loss
             'uniformity_loss': diversity_entropy.item(),
-            'selected_interest_idx': selected_idx  # 用于分析
+            'selected_interest_idx': selected_idx  # (B,) 用于计算索引一致率
         }
 
     def calculate_infonce_loss(self, tokens, label_eb, base_temperature=0.07):

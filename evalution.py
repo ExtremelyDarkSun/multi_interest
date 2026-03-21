@@ -242,8 +242,18 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
         load_teacher_weights(model, teacher_model_path)
         print(f"[Pretrain Stage-2] Teacher weights loaded from {teacher_model_path}; proceeding with joint training")
 
+        # 冻结 tokenizer，student 继续正常训练
+        for param in model.tokenizer.parameters():
+            param.requires_grad = False
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        print(f"[Finetune] Tokenizer frozen. Trainable: {trainable}/{total} params")
+
     loss_fn = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr = lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=lr, weight_decay=args.weight_decay
+    )
 
     trials = 0
 
@@ -376,8 +386,10 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
                     print(f"[DASD-DisMIR Loss Details @ iter {iter}] "
                           f"dismir_bpr: {avg_losses.get('dismir_bpr', 0):.4f}, "
                           f"select_bpr: {avg_losses.get('select_bpr_loss', 0):.4f}, "
-                          f"uniformity: {avg_losses.get('uniformity_loss', 0):.4f}, "
+                          f"embed_align: {avg_losses.get('embed_align_loss', 0):.4f}, "
                           f"teacher_mse: {avg_losses.get('teacher_mse', 0):.4f}, "
+                          f"idx_agree: {avg_losses.get('index_agreement', 0):.4f}, "
+                          f"uniformity: {avg_losses.get('uniformity_loss', 0):.4f}, "
                           f"partition: {avg_losses.get('partition_loss', 0):.4f}, "
                           f"atten: {avg_losses.get('atten_loss', 0):.4f}, "
                           f"total: {avg_losses.get('total_loss', 0):.4f}")
