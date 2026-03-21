@@ -644,54 +644,52 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                     gpu_index = faiss.GpuIndexFlatIP(res, hidden_size, flat_config)
                     gpu_index.add(item_embs)
 
+                    codebook_size = model.tokenizer.vq.num_embeddings
+                    used_codes = set()  # 收集整个 valid 集上使用过的 codebook entry
+
                     for _, (v_users, v_targets, v_items, v_mask, v_times) in enumerate(valid_data):
-                        # Extract target labels (first item for each user)
-                        # Both train and eval use the first label only
                         target_labels = [t[0] if isinstance(t, (list, tuple)) else t for t in v_targets]
 
-                        # Use Teacher to generate single token (recon_target)
-                        teacher_token = model.encode_with_teacher(
+                        # encode_with_teacher 返回 (recon_target, vq_indices)
+                        teacher_token, vq_indices = model.encode_with_teacher(
                             to_tensor(v_items, device),
                             to_tensor(target_labels, device),
                             to_tensor(v_mask, device),
                             device
-                        )  # (B, hidden_size) - single token
+                        )  # (B, D), (B, K)
 
-                        # Convert to numpy for faiss search
+                        # 收集 codebook indices
+                        used_codes.update(vq_indices.cpu().numpy().flatten().tolist())
+
                         token_np = teacher_token.cpu().numpy()  # (B, D)
+                        D, I = gpu_index.search(token_np, topN)
 
-                        # Single token evaluation: direct search, no need to reshape
-                        D, I = gpu_index.search(token_np, topN)  # D: distances, I: indices
-
-                        # For each user, evaluate against the single target label
-                        # NOTE: Evaluate against the first label only (same as training)
                         for i, target_label in enumerate(target_labels):
                             recall = 0
                             dcg = 0.0
-
-                            # Calculate metrics against the single target label
-                            # I[i] gives topN items for user i
                             target_found = False
                             for no, iid in enumerate(I[i]):
                                 if iid == target_label:
-                                    recall = 1  # Found the target
+                                    recall = 1
                                     dcg = 1.0 / math.log(no + 2, 2)
                                     target_found = True
                                     break
-
-                            # For single-label evaluation: recall is either 0 or 1
-                            total_recall += recall  # recall is 0 or 1
+                            total_recall += recall
                             if target_found:
-                                total_ndcg += dcg  # dcg = 1/log2(rank+2), idcg = 1 for single item
+                                total_ndcg += dcg
                                 total_hitrate += 1
 
                         total += len(target_labels)
+
+                # codebook 利用率
+                codebook_utilization = len(used_codes) / codebook_size
 
                 # Aggregate metrics
                 metrics = {
                     'recall': total_recall / total if total > 0 else 0,
                     'ndcg': total_ndcg / total if total > 0 else 0,
-                    'hitrate': total_hitrate * 1.0 / total if total > 0 else 0
+                    'hitrate': total_hitrate * 1.0 / total if total > 0 else 0,
+                    'codebook_util': codebook_utilization,
                 }
                 # ========== End Teacher-specific evaluation ==========
 
@@ -699,13 +697,13 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                 current_recall = metrics.get('recall', 0)
                 print(f"[Pretrain-Teacher @ iter {iter_count}] "
                       f"val_recon: {val_avg.get('recon_loss', 0):.6f}, "
-                      f"val_w_recon: {val_avg.get('weighted_recon_loss', 0):.6f}, "
                       f"val_vq: {val_avg.get('vq_loss', 0):.6f}, "
-                      f"val_w_vq: {val_avg.get('weighted_vq_loss', 0):.6f}, "
-                      f"val_total: {val_avg.get('total_loss', 0):.6f}  "
+                      f"val_total: {val_avg.get('total_loss', 0):.6f}  |  "
                       f"recall@{topN}: {current_recall:.6f} {'★BEST' if current_recall > best_recall else ''}, "
                       f"ndcg@{topN}: {metrics.get('ndcg', 0):.6f}, "
-                      f"hitrate@{topN}: {metrics.get('hitrate', 0):.6f}  "
+                      f"hitrate@{topN}: {metrics.get('hitrate', 0):.6f}  |  "
+                      f"codebook_util: {metrics.get('codebook_util', 0):.3f} "
+                      f"({int(metrics.get('codebook_util', 0) * codebook_size)}/{codebook_size})  |  "
                       f"time: {(test_time - start_time) / 60:.2f}min")
                 sys.stdout.flush()
 

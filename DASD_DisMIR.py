@@ -486,13 +486,12 @@ class ContextGatedTokenizer(nn.Module):
         self.norm_gate = Qwen3NextRMSNorm(hidden_size, eps=1e-6)
 
         # --- Step 5: Reconstruction Block ---
+        # concat K tokens → project to hidden_size（替代 sum，保留多 token 结构信息）
         self.recon_proj = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 2),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size * 2, hidden_size)
+            nn.Linear(num_tokens * hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size),
         )
-        self.norm_out = Qwen3NextRMSNorm(hidden_size, eps=1e-6)
 
         self.dimension_gate = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
@@ -585,15 +584,21 @@ class ContextGatedTokenizer(nn.Module):
         # 应用门控权重
         gated_tokens = tokens * gate_weights  # [B, num_tokens, hidden_size]
 
-        # VQ 量化
-        quantized_tokens, vq_loss, _ = self.vq(gated_tokens)   # [B, K, D], scalar
-        reconstructed = quantized_tokens.sum(dim=1)             # [B, D]
+        # VQ 量化（保留 idx 用于 codebook 利用率统计）
+        quantized_tokens, vq_loss, vq_indices = self.vq(gated_tokens)   # [B, K, D], scalar, [B, K]
+
+        # concat K tokens → MLP → recon（替代 sum，精度更高）
+        B_qt = quantized_tokens.shape[0]
+        reconstructed = self.recon_proj(
+            quantized_tokens.view(B_qt, self.num_tokens * self.hidden_size)
+        )   # [B, D]
 
         # 返回：
-        # - quantized_tokens: [batch_size, num_tokens, hidden_size]
-        # - reconstructed: [batch_size, hidden_size]
-        # - vq_loss: scalar
-        return quantized_tokens, reconstructed, vq_loss
+        # - quantized_tokens: [B, K, D]
+        # - reconstructed:    [B, D]
+        # - vq_loss:          scalar
+        # - vq_indices:       [B, K]  codebook entry indices，用于利用率统计
+        return quantized_tokens, reconstructed, vq_loss, vq_indices
 
 
 # ============ 4. DASD_DisMIR 主类 ============
@@ -746,7 +751,7 @@ class DASD_DisMIR(BasicModel):
         history_eb = history_eb * mask.unsqueeze(-1)
 
         tokenizer_input = self._apply_ddpm_noise(label_eb) if self.training else label_eb
-        quantized_tokens, recon_target, vq_loss = self.tokenizer(
+        quantized_tokens, recon_target, vq_loss, _ = self.tokenizer(
             tokenizer_input, history_eb, mask
         )   # quantized_tokens: (B, K, D)
         K = quantized_tokens.shape[1]
@@ -843,13 +848,15 @@ class DASD_DisMIR(BasicModel):
         history_eb = self.dismir.embeddings(item_list)  # (batch_size, seq_len, hidden_size)
         history_eb = history_eb * mask.unsqueeze(-1)  # (batch_size, seq_len, hidden_size)
 
-        # 调用 tokenizer 生成 tokens 和 recon_target
-        quantized_tokens, recon_target, _vq_loss = self.tokenizer(label_eb, history_eb, mask)
+        # 调用 tokenizer 生成 tokens、recon_target 和 VQ indices
+        quantized_tokens, recon_target, _vq_loss, vq_indices = self.tokenizer(
+            label_eb, history_eb, mask
+        )
 
         # 归一化以匹配训练时的MSE loss（F.normalize）
         recon_target = F.normalize(recon_target, dim=-1)
 
-        return recon_target  # (batch_size, hidden_size) - 单token（已归一化）
+        return recon_target, vq_indices  # (B, D), (B, K)
 
     def forward_teacher_pretrain(self, item_list, label_list, mask, times, device):
         """
@@ -864,9 +871,7 @@ class DASD_DisMIR(BasicModel):
         # [改动] 加噪（防平凡解：tokenizer 不能直接透传 label_eb）
         noisy_label_eb = self._apply_ddpm_noise(label_eb)
 
-        # [改动] 解包 3 值
-        quantized_tokens, recon_target, vq_loss = self.tokenizer(noisy_label_eb, history_eb, mask)
-        # recon_target: (B, hidden_size) - quantized_tokens.sum(dim=1)
+        quantized_tokens, recon_target, vq_loss, _ = self.tokenizer(noisy_label_eb, history_eb, mask)
 
         # Reconstruction/MSE loss
         recon_loss = F.mse_loss(
