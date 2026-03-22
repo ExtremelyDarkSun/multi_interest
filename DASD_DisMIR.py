@@ -762,7 +762,6 @@ class DASD_DisMIR(BasicModel):
 
         # DisMIR forward 返回: (interests, scores, atten, readout, selection)
         interests, scores, atten, readout, selection = dismir_output
-        B = label_list.shape[0]
 
         # 2. Teacher 前向（Stage-2 tokenizer 可训练，始终加噪）
         label_eb   = self.dismir.embeddings(label_list).detach()   # (B, D)
@@ -773,7 +772,6 @@ class DASD_DisMIR(BasicModel):
         quantized_tokens, recon_target, vq_loss, _ = self.tokenizer(
             tokenizer_input, history_eb, mask
         )   # quantized_tokens: (B, K, D)
-        K = quantized_tokens.shape[1]
 
         # 3. Teacher MSE loss（约束 tokenizer 重构目标物品）
         teacher_mse = F.mse_loss(
@@ -781,32 +779,10 @@ class DASD_DisMIR(BasicModel):
             F.normalize(label_eb, dim=-1)
         )
 
-        # 4. DisMIR BPR（teacher token 检索困难负样本）
-        pos_eb     = self.dismir.embeddings(label_list)            # (B, D) 有梯度
-        pos_scores = (readout * pos_eb).sum(dim=-1)                # (B,)
-
-        # Teacher token 在候选池中找语义最相似的 H 个 item 作为难负样本
-        H         = self.dismir.hard_neg_candidates
-        pool_size = H * K
-        cand_ids  = torch.randint(0, self.item_num, (pool_size,), device=device)
-        cand_eb   = self.dismir.embeddings(cand_ids)               # (pool_size, D)
-
-        with torch.no_grad():
-            sim_tok_cand = torch.einsum(
-                'bkd,nd->bkn',
-                F.normalize(quantized_tokens, dim=-1),
-                F.normalize(cand_eb, dim=-1)
-            )   # (B, K, pool_size)
-            _, top_idx = sim_tok_cand.topk(H, dim=-1)              # (B, K, H)
-
-        hard_neg_eb    = cand_eb[top_idx].view(B, K * H, -1)       # (B, K*H, D)
-        neg_scores     = torch.einsum('bd,bnd->bn', readout, hard_neg_eb)  # (B, K*H)
-        hardest_neg, _ = neg_scores.max(dim=-1)                    # (B,)
-        hard_diff      = torch.clamp(pos_scores - hardest_neg, -20, 20)
-        hard_loss      = -F.logsigmoid(hard_diff)                  # (B,)
-        all_diff       = torch.clamp(pos_scores.unsqueeze(1) - neg_scores, -20, 20)
-        all_loss       = -F.logsigmoid(all_diff).mean(dim=-1)      # (B,)
-        dismir_bpr     = (hard_loss + all_loss).mean()
+        # 4. DisMIR BPR（使用 DisMIR 原始 hard negative BPR，shared negatives）
+        dismir_bpr = self.dismir.compute_bpr_loss_with_hard_negative(
+            readout, label_list, self.dismir.hard_neg_candidates
+        )
 
         # 5. ChamferLoss：aspect token 集合 ↔ student interest 集合
         chamfer_loss_val = self.chamfer_loss(quantized_tokens, interests)

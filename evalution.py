@@ -394,7 +394,7 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
                 if iter % loss_print_interval == 0 and iter > 0:
                     avg_losses = {k: v/loss_print_interval for k, v in loss_accumulators.items()}
                     print(f"[DASD-DisMIR Loss Details @ iter {iter}] "
-                          f"dismir_bpr: {avg_losses.get('dismir_bpr', 0):.4f}, "
+                          f"bpr: {avg_losses.get('dismir_bpr', 0):.4f}, "
                           f"teacher_mse: {avg_losses.get('teacher_mse', 0):.4f}, "
                           f"chamfer: {avg_losses.get('chamfer_loss', 0):.4f}, "
                           f"vq: {avg_losses.get('vq_loss', 0):.4f}, "
@@ -507,15 +507,13 @@ def save_teacher_weights(model, teacher_model_path):
 
 
 def load_teacher_weights(model, teacher_model_path):
-    """Load Tokenizer (Teacher) weights + shared embeddings into model."""
+    """Load Tokenizer (Teacher) weights only. dismir.embeddings is NOT restored
+    so Stage-2 always starts with freshly-initialised item embeddings."""
     path = teacher_model_path + 'teacher.pt'
     state = torch.load(path, map_location='cpu')
     model.tokenizer.load_state_dict(state['tokenizer'])
-    # Load shared embeddings (backward-compat: old checkpoints used 'teacher_embeddings' key)
-    key = 'embeddings' if 'embeddings' in state else 'teacher_embeddings'
-    model.dismir.embeddings.load_state_dict(state[key])
-    print(f"Loaded embeddings from checkpoint key='{key}' into dismir.embeddings")
-    print(f'Teacher weights loaded from {path}')
+    print(f'Teacher (tokenizer) weights loaded from {path}')
+    print('[Stage-2] dismir.embeddings kept at fresh random init (not loaded from Stage-1)')
 
 
 def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
