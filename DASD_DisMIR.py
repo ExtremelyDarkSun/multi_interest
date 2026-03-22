@@ -425,18 +425,18 @@ class VectorQuantizer(nn.Module):
         # SimVQ: linear projection decouples input space from codebook space
         self.sim_proj = nn.Linear(embedding_dim, embedding_dim, bias=False)
 
-    def forward(self, tokens):      # tokens: [B, 1, D]
+    def forward(self, tokens):      # tokens: [B, K, D]
         B, K, D = tokens.shape
-        flat = tokens.view(-1, D)   # [B, D]
+        flat = tokens.view(-1, D)   # [B*K, D]
 
         # SimVQ: project codebook before distance computation
         codebook = self.sim_proj(self.codebook.weight)  # [C, D]
 
         dist = (flat.pow(2).sum(1, keepdim=True)
                 - 2.0 * flat @ codebook.t()
-                + codebook.pow(2).sum(1))               # [B, C]
-        idx = dist.detach().argmin(dim=1)               # [B]
-        q   = codebook[idx]                             # [B, D]
+                + codebook.pow(2).sum(1))               # [B*K, C]
+        idx = dist.detach().argmin(dim=1)               # [B*K]
+        q   = codebook[idx]                             # [B*K, D]
 
         vq_loss = (F.mse_loss(q.detach(), flat)
                    + self.commitment_cost * F.mse_loss(q, flat.detach()))
@@ -547,11 +547,7 @@ class ContextGatedTokenizer(nn.Module):
         # 可选：添加温度参数来控制softmax的锐利程度
         self.gate_temperature = nn.Parameter(torch.ones(1))
 
-        # 每个 aspect token 独立 codebook，防止多 token 量化到同一 code
-        self.vq = nn.ModuleList([
-            VectorQuantizer(num_embeddings, hidden_size, vq_commitment_cost)
-            for _ in range(num_tokens)
-        ])
+        self.vq = VectorQuantizer(num_embeddings, hidden_size, vq_commitment_cost)
 
         self._reset_parameters()
 
@@ -656,16 +652,8 @@ class ContextGatedTokenizer(nn.Module):
         # 应用门控权重
         gated_tokens = tokens * gate_weights  # [B, num_tokens, hidden_size]
 
-        # VQ 量化：每个 aspect token 独立量化
-        q_list, loss_list, idx_list = [], [], []
-        for k, vq_k in enumerate(self.vq):
-            q_k, loss_k, idx_k = vq_k(gated_tokens[:, k:k+1, :])  # [B, 1, D]
-            q_list.append(q_k)
-            loss_list.append(loss_k)
-            idx_list.append(idx_k)
-        quantized_tokens = torch.cat(q_list,   dim=1)            # [B, K, D]
-        vq_loss          = sum(loss_list) / self.num_tokens       # scalar
-        vq_indices       = torch.cat(idx_list, dim=1)            # [B, K]
+        # VQ 量化（保留 idx 用于 codebook 利用率统计）
+        quantized_tokens, vq_loss, vq_indices = self.vq(gated_tokens)   # [B, K, D], scalar, [B, K]
 
         # 互注意力组合 K tokens → recon
         reconstructed = self.combine_tokens(quantized_tokens)   # [B, D]
