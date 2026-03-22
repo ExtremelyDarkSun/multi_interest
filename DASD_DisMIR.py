@@ -409,7 +409,7 @@ class VectorQuantizer(nn.Module):
 
         codebook_loss = F.mse_loss(q.detach(), flat)
         commit_loss   = F.mse_loss(q, flat.detach())
-        vq_loss       = codebook_loss + self.commitment_cost * commit_loss
+        vq_loss       = self.commitment_cost * codebook_loss + commit_loss
 
         # Dead code revival: reset rarely-used codes to random input vectors
         if self.training and self.revival_threshold > 0:
@@ -519,7 +519,7 @@ class ContextGatedTokenizer(nn.Module):
         # 可选：添加温度参数来控制softmax的锐利程度
         self.gate_temperature = nn.Parameter(torch.ones(1))
 
-        self.vq = VectorQuantizer(num_embeddings, hidden_size, vq_commitment_cost)
+        self.vq = VectorQuantizer(num_embeddings, hidden_size, vq_commitment_cost, revival_threshold=0)
 
         self._reset_parameters()
 
