@@ -383,76 +383,48 @@ class Qwen3NextCrossAttention(nn.Module):
         return tokens, attn_weights
 
 
-def _rotation_trick(u: torch.Tensor, q: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
-    """
-    Rotation Trick gradient estimator. Section 4.2 in https://arxiv.org/abs/2410.06424
-
-    Args:
-        u: normalized input          [N, D]
-        q: normalized codebook entry [N, D]
-        e: original input            [N, D]
-    Returns:
-        rotated: [N, D]  — same forward value as e rotated toward q,
-                           but gradient flows through e (not blocked by argmin)
-    """
-    w     = F.normalize(u + q, p=2, dim=-1).detach()   # [N, D]
-    e_3d  = e.unsqueeze(1)                              # [N, 1, D]
-    w_col = w.unsqueeze(2)                              # [N, D, 1]
-    w_row = w.unsqueeze(1)                              # [N, 1, D]
-    u_col = u.detach().unsqueeze(2)                     # [N, D, 1]
-    q_row = q.detach().unsqueeze(1)                     # [N, 1, D]
-    return (
-        e_3d
-        - 2 * torch.bmm(torch.bmm(e_3d, w_col), w_row)
-        + 2 * torch.bmm(torch.bmm(e_3d, u_col), q_row)
-    ).squeeze(1)                                        # [N, D]
-
-
 class VectorQuantizer(nn.Module):
-    """
-    VQ module with:
-      - SimVQ: linear projection before codebook lookup (arxiv:2411.02038)
-      - Rotation Trick gradient estimator (arxiv:2410.06424)
-    Intended to be used as K independent instances (one per aspect token).
-    """
-    def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float = 0.25):
+    def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float = 0.25,
+                 revival_threshold: int = 1):
+        """
+        revival_threshold: codes used < threshold per batch will be reset to random input vectors.
+        Set to 0 to disable dead code revival.
+        """
         super().__init__()
-        self.embedding_dim   = embedding_dim
-        self.num_embeddings  = num_embeddings
-        self.commitment_cost = commitment_cost
+        self.embedding_dim      = embedding_dim
+        self.num_embeddings     = num_embeddings
+        self.commitment_cost    = commitment_cost
+        self.revival_threshold  = revival_threshold
         self.codebook = nn.Embedding(num_embeddings, embedding_dim)
         nn.init.uniform_(self.codebook.weight, -1.0 / num_embeddings, 1.0 / num_embeddings)
-        # SimVQ: linear projection decouples input space from codebook space
-        self.sim_proj = nn.Linear(embedding_dim, embedding_dim, bias=False)
 
-    def forward(self, tokens):      # tokens: [B, K, D]
+    def forward(self, tokens):          # tokens: [B, K, D]
         B, K, D = tokens.shape
-        flat = tokens.view(-1, D)   # [B*K, D]
-
-        # SimVQ: project codebook before distance computation
-        codebook = self.sim_proj(self.codebook.weight)  # [C, D]
-
+        flat = tokens.view(-1, D)       # [B*K, D]
         dist = (flat.pow(2).sum(1, keepdim=True)
-                - 2.0 * flat @ codebook.t()
-                + codebook.pow(2).sum(1))               # [B*K, C]
-        idx = dist.detach().argmin(dim=1)               # [B*K]
-        q   = codebook[idx]                             # [B*K, D]
+                - 2.0 * flat @ self.codebook.weight.t()
+                + self.codebook.weight.pow(2).sum(1))   # [B*K, C]
+        idx  = dist.argmin(dim=1)                        # [B*K]
+        q    = self.codebook(idx)                        # [B*K, D]
 
-        vq_loss = (F.mse_loss(q.detach(), flat)
-                   + self.commitment_cost * F.mse_loss(q, flat.detach()))
+        codebook_loss = F.mse_loss(q.detach(), flat)
+        commit_loss   = F.mse_loss(q, flat.detach())
+        vq_loss       = codebook_loss + self.commitment_cost * commit_loss
 
-        if self.training:
-            # Rotation Trick: hard forward value, clean gradient through e
-            u     = F.normalize(flat, p=2, dim=-1)
-            q_hat = F.normalize(q,    p=2, dim=-1)
-            q_st  = _rotation_trick(u, q_hat, flat)
-            # Rescale to preserve codebook vector magnitude
-            scale = (q.norm(dim=-1, keepdim=True)
-                     / (flat.norm(dim=-1, keepdim=True) + 1e-8)).detach()
-            q_st  = q_st * scale
-        else:
-            q_st = q
+        # Dead code revival: reset rarely-used codes to random input vectors
+        if self.training and self.revival_threshold > 0:
+            # Count usage for each code in this batch
+            usage = torch.zeros(self.num_embeddings, device=flat.device)
+            unique_idx, counts = idx.unique(return_counts=True)
+            usage[unique_idx] = counts.float()
+            dead_codes = (usage < self.revival_threshold).nonzero(as_tuple=True)[0]
+            if len(dead_codes) > 0:
+                n_dead = dead_codes.shape[0]
+                rand_idx = torch.randint(0, flat.shape[0], (n_dead,), device=flat.device)
+                with torch.no_grad():
+                    self.codebook.weight[dead_codes] = flat[rand_idx].detach()
 
+        q_st = flat + (q - flat).detach()               # straight-through
         return q_st.view(B, K, D), vq_loss, idx.view(B, K)
 
 
