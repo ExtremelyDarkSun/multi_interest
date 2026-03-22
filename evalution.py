@@ -395,6 +395,9 @@ def train(device, train_file, valid_file, test_file, dataset, model_type, item_c
                     avg_losses = {k: v/loss_print_interval for k, v in loss_accumulators.items()}
                     print(f"[DASD-DisMIR Loss Details @ iter {iter}] "
                           f"bpr: {avg_losses.get('dismir_bpr', 0):.4f}, "
+                          f"false_bpr: {avg_losses.get('false_bpr', 0):.4f} "
+                          f"(hard={avg_losses.get('false_bpr_hard', 0):.4f}, "
+                          f"all={avg_losses.get('false_bpr_all', 0):.4f}), "
                           f"teacher_mse: {avg_losses.get('teacher_mse', 0):.4f}, "
                           f"chamfer: {avg_losses.get('chamfer_loss', 0):.4f}, "
                           f"vq: {avg_losses.get('vq_loss', 0):.4f}, "

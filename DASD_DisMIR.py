@@ -383,48 +383,76 @@ class Qwen3NextCrossAttention(nn.Module):
         return tokens, attn_weights
 
 
+def _rotation_trick(u: torch.Tensor, q: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
+    """
+    Rotation Trick gradient estimator. Section 4.2 in https://arxiv.org/abs/2410.06424
+
+    Args:
+        u: normalized input          [N, D]
+        q: normalized codebook entry [N, D]
+        e: original input            [N, D]
+    Returns:
+        rotated: [N, D]  — same forward value as e rotated toward q,
+                           but gradient flows through e (not blocked by argmin)
+    """
+    w     = F.normalize(u + q, p=2, dim=-1).detach()   # [N, D]
+    e_3d  = e.unsqueeze(1)                              # [N, 1, D]
+    w_col = w.unsqueeze(2)                              # [N, D, 1]
+    w_row = w.unsqueeze(1)                              # [N, 1, D]
+    u_col = u.detach().unsqueeze(2)                     # [N, D, 1]
+    q_row = q.detach().unsqueeze(1)                     # [N, 1, D]
+    return (
+        e_3d
+        - 2 * torch.bmm(torch.bmm(e_3d, w_col), w_row)
+        + 2 * torch.bmm(torch.bmm(e_3d, u_col), q_row)
+    ).squeeze(1)                                        # [N, D]
+
+
 class VectorQuantizer(nn.Module):
-    def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float = 0.25,
-                 revival_threshold: int = 1):
-        """
-        revival_threshold: codes used < threshold per batch will be reset to random input vectors.
-        Set to 0 to disable dead code revival.
-        """
+    """
+    VQ module with:
+      - SimVQ: linear projection before codebook lookup (arxiv:2411.02038)
+      - Rotation Trick gradient estimator (arxiv:2410.06424)
+    Intended to be used as K independent instances (one per aspect token).
+    """
+    def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float = 0.25):
         super().__init__()
-        self.embedding_dim      = embedding_dim
-        self.num_embeddings     = num_embeddings
-        self.commitment_cost    = commitment_cost
-        self.revival_threshold  = revival_threshold
+        self.embedding_dim   = embedding_dim
+        self.num_embeddings  = num_embeddings
+        self.commitment_cost = commitment_cost
         self.codebook = nn.Embedding(num_embeddings, embedding_dim)
         nn.init.uniform_(self.codebook.weight, -1.0 / num_embeddings, 1.0 / num_embeddings)
+        # SimVQ: linear projection decouples input space from codebook space
+        self.sim_proj = nn.Linear(embedding_dim, embedding_dim, bias=False)
 
-    def forward(self, tokens):          # tokens: [B, K, D]
+    def forward(self, tokens):      # tokens: [B, 1, D]
         B, K, D = tokens.shape
-        flat = tokens.view(-1, D)       # [B*K, D]
+        flat = tokens.view(-1, D)   # [B, D]
+
+        # SimVQ: project codebook before distance computation
+        codebook = self.sim_proj(self.codebook.weight)  # [C, D]
+
         dist = (flat.pow(2).sum(1, keepdim=True)
-                - 2.0 * flat @ self.codebook.weight.t()
-                + self.codebook.weight.pow(2).sum(1))   # [B*K, C]
-        idx  = dist.argmin(dim=1)                        # [B*K]
-        q    = self.codebook(idx)                        # [B*K, D]
+                - 2.0 * flat @ codebook.t()
+                + codebook.pow(2).sum(1))               # [B, C]
+        idx = dist.detach().argmin(dim=1)               # [B]
+        q   = codebook[idx]                             # [B, D]
 
-        codebook_loss = F.mse_loss(q.detach(), flat)
-        commit_loss   = F.mse_loss(q, flat.detach())
-        vq_loss       = codebook_loss + self.commitment_cost * commit_loss
+        vq_loss = (F.mse_loss(q.detach(), flat)
+                   + self.commitment_cost * F.mse_loss(q, flat.detach()))
 
-        # Dead code revival: reset rarely-used codes to random input vectors
-        if self.training and self.revival_threshold > 0:
-            # Count usage for each code in this batch
-            usage = torch.zeros(self.num_embeddings, device=flat.device)
-            unique_idx, counts = idx.unique(return_counts=True)
-            usage[unique_idx] = counts.float()
-            dead_codes = (usage < self.revival_threshold).nonzero(as_tuple=True)[0]
-            if len(dead_codes) > 0:
-                n_dead = dead_codes.shape[0]
-                rand_idx = torch.randint(0, flat.shape[0], (n_dead,), device=flat.device)
-                with torch.no_grad():
-                    self.codebook.weight[dead_codes] = flat[rand_idx].detach()
+        if self.training:
+            # Rotation Trick: hard forward value, clean gradient through e
+            u     = F.normalize(flat, p=2, dim=-1)
+            q_hat = F.normalize(q,    p=2, dim=-1)
+            q_st  = _rotation_trick(u, q_hat, flat)
+            # Rescale to preserve codebook vector magnitude
+            scale = (q.norm(dim=-1, keepdim=True)
+                     / (flat.norm(dim=-1, keepdim=True) + 1e-8)).detach()
+            q_st  = q_st * scale
+        else:
+            q_st = q
 
-        q_st = flat + (q - flat).detach()               # straight-through
         return q_st.view(B, K, D), vq_loss, idx.view(B, K)
 
 
@@ -504,13 +532,11 @@ class ContextGatedTokenizer(nn.Module):
         self.value_proj = nn.Linear(hidden_size, hidden_size)
         self.norm_gate = Qwen3NextRMSNorm(hidden_size, eps=1e-6)
 
-        # --- Step 5: Reconstruction Block ---
-        # concat K tokens → project to hidden_size（替代 sum，保留多 token 结构信息）
-        self.recon_proj = nn.Sequential(
-            nn.Linear(num_tokens * hidden_size, hidden_size),
-            nn.GELU(),
-            nn.Linear(hidden_size, hidden_size),
-        )
+        # --- Step 5: Token 互注意力组合模块（替代 recon_proj）---
+        self.combine_q   = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.combine_k   = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.combine_out = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.combine_scale = hidden_size ** -0.5
 
         self.dimension_gate = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
@@ -521,7 +547,11 @@ class ContextGatedTokenizer(nn.Module):
         # 可选：添加温度参数来控制softmax的锐利程度
         self.gate_temperature = nn.Parameter(torch.ones(1))
 
-        self.vq = VectorQuantizer(num_embeddings, hidden_size, vq_commitment_cost)
+        # 每个 aspect token 独立 codebook，防止多 token 量化到同一 code
+        self.vq = nn.ModuleList([
+            VectorQuantizer(num_embeddings, hidden_size, vq_commitment_cost)
+            for _ in range(num_tokens)
+        ])
 
         self._reset_parameters()
 
@@ -529,6 +559,29 @@ class ContextGatedTokenizer(nn.Module):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+
+    def combine_tokens(self, tokens: torch.Tensor,
+                       override_weights: torch.Tensor = None) -> torch.Tensor:
+        """
+        用 token 互注意力组合 K 个 token → 单向量表示
+
+        Args:
+            tokens:           [B, K, D]
+            override_weights: [B, K, K] 可选。若传入则跳过学习到的注意力权重，
+                              直接使用此矩阵（用于生成 hard_false_target）
+        Returns:
+            combined: [B, D]
+        """
+        if override_weights is None:
+            Q = self.combine_q(tokens)                                    # [B, K, D]
+            K = self.combine_k(tokens)                                    # [B, K, D]
+            attn = torch.bmm(Q, K.transpose(1, 2)) * self.combine_scale  # [B, K, K]
+            weights = F.softmax(attn, dim=-1)                             # [B, K, K]
+        else:
+            weights = override_weights                                    # [B, K, K]
+
+        out = torch.bmm(weights, tokens).mean(dim=1)   # [B, D]（K 个输出取均值）
+        return self.combine_out(out)                   # [B, D]
 
     def forward(self, target_emb, history_emb, mask):
         """
@@ -603,14 +656,19 @@ class ContextGatedTokenizer(nn.Module):
         # 应用门控权重
         gated_tokens = tokens * gate_weights  # [B, num_tokens, hidden_size]
 
-        # VQ 量化（保留 idx 用于 codebook 利用率统计）
-        quantized_tokens, vq_loss, vq_indices = self.vq(gated_tokens)   # [B, K, D], scalar, [B, K]
+        # VQ 量化：每个 aspect token 独立量化
+        q_list, loss_list, idx_list = [], [], []
+        for k, vq_k in enumerate(self.vq):
+            q_k, loss_k, idx_k = vq_k(gated_tokens[:, k:k+1, :])  # [B, 1, D]
+            q_list.append(q_k)
+            loss_list.append(loss_k)
+            idx_list.append(idx_k)
+        quantized_tokens = torch.cat(q_list,   dim=1)            # [B, K, D]
+        vq_loss          = sum(loss_list) / self.num_tokens       # scalar
+        vq_indices       = torch.cat(idx_list, dim=1)            # [B, K]
 
-        # concat K tokens → MLP → recon（替代 sum，精度更高）
-        B_qt = quantized_tokens.shape[0]
-        reconstructed = self.recon_proj(
-            quantized_tokens.view(B_qt, self.num_tokens * self.hidden_size)
-        )   # [B, D]
+        # 互注意力组合 K tokens → recon
+        reconstructed = self.combine_tokens(quantized_tokens)   # [B, D]
 
         # 返回：
         # - quantized_tokens: [B, K, D]
@@ -696,6 +754,8 @@ class DASD_DisMIR(BasicModel):
         self.register_buffer('ddpm_alphas_bar', alphas_bar)
         self.ddpm_T    = noise_T
         self.lambda_vq = getattr(args, 'lambda_vq', 0.1)
+        self.lambda_false            = getattr(args, 'lambda_false',            0.5)
+        self.num_false_weight_sample = getattr(args, 'num_false_weight_sample', 10)
 
         # 初始化TargetAwareFusion (目标感知融合层)
         # NOTE: 当前未使用，实际使用 dismir.read_out() 进行硬选择
@@ -784,6 +844,52 @@ class DASD_DisMIR(BasicModel):
             readout, label_list, self.dismir.hard_neg_candidates
         )
 
+        # 4b. Hard false target BPR
+        #     用同一批 quantized_tokens + num_false_weight_sample 组随机权重 → 多个错误配比假目标
+        if self.lambda_false > 0:
+            B_   = quantized_tokens.shape[0]
+            K_   = quantized_tokens.shape[1]
+            N_f  = self.num_false_weight_sample  # 默认 10
+
+            # 为每个样本采样 N_f 组 [K, K] 随机权重 → [B, N_f, K, K]
+            rand_logits  = torch.rand(B_, N_f, K_, K_, device=device)
+            rand_weights = F.softmax(rand_logits, dim=-1)            # [B, N_f, K, K]
+
+            with torch.no_grad():
+                # 对 N_f 组权重批量调用 combine_tokens
+                tokens_exp  = quantized_tokens.unsqueeze(1).expand(
+                                  -1, N_f, -1, -1
+                              ).reshape(B_ * N_f, K_, -1)           # [B*N_f, K, D]
+                rand_w_flat = rand_weights.reshape(B_ * N_f, K_, K_) # [B*N_f, K, K]
+                false_flat  = self.tokenizer.combine_tokens(
+                                  tokens_exp, override_weights=rand_w_flat
+                              )                                       # [B*N_f, D]
+                hard_false_targets = false_flat.reshape(B_, N_f, -1) # [B, N_f, D]
+
+            pos_eb_false  = self.dismir.embeddings(label_list)            # [B, D]，有梯度
+            pos_scores_f  = (readout * pos_eb_false).sum(dim=-1)          # [B]
+            # 对 N_f 个假目标打分：[B, N_f]
+            false_scores  = torch.einsum(
+                'bd,bnd->bn', readout, hard_false_targets
+            )                                                              # [B, N_f]
+
+            # 取最难（最高分）负样本
+            hardest_false, _ = false_scores.max(dim=-1)                   # [B]
+            hard_diff    = torch.clamp(pos_scores_f - hardest_false, -20, 20)
+            hard_false_loss = -F.logsigmoid(hard_diff)                    # [B]
+
+            # 所有负样本均值
+            all_false_diff  = torch.clamp(
+                pos_scores_f.unsqueeze(1) - false_scores, -20, 20
+            )                                                              # [B, N_f]
+            all_false_loss  = -F.logsigmoid(all_false_diff).mean(dim=-1)  # [B]
+
+            false_bpr = (hard_false_loss + all_false_loss).mean()
+        else:
+            false_bpr = torch.tensor(0.0, device=device)
+            hard_false_loss = torch.zeros(1, device=device)
+            all_false_loss  = torch.zeros(1, device=device)
+
         # 5. ChamferLoss：aspect token 集合 ↔ student interest 集合
         chamfer_loss_val = self.chamfer_loss(quantized_tokens, interests)
 
@@ -802,7 +908,8 @@ class DASD_DisMIR(BasicModel):
 
         # 8. 总 Loss
         total_loss = (
-            self.lambda_bpr   * dismir_bpr +
+            self.lambda_bpr   * dismir_bpr   +
+            self.lambda_false * false_bpr    +
             self.lambda_recon * teacher_mse +
             self.lambda_align * chamfer_loss_val +
             self.dismir.lambda_coef * partition_loss +
@@ -811,13 +918,16 @@ class DASD_DisMIR(BasicModel):
         )
 
         loss_dict = {
-            'dismir_bpr':    dismir_bpr.item(),
-            'teacher_mse':   teacher_mse.item(),
-            'chamfer_loss':  chamfer_loss_val.item(),
-            'vq_loss':       vq_loss.item(),
-            'partition_loss': partition_loss.item() if isinstance(partition_loss, torch.Tensor) else partition_loss,
-            'atten_loss':    atten_loss.item() if isinstance(atten_loss, torch.Tensor) else atten_loss,
-            'total_loss':    total_loss.item(),
+            'dismir_bpr':      dismir_bpr.item(),
+            'false_bpr':       false_bpr.item(),
+            'false_bpr_hard':  hard_false_loss.mean().item(),
+            'false_bpr_all':   all_false_loss.mean().item(),
+            'teacher_mse':     teacher_mse.item(),
+            'chamfer_loss':    chamfer_loss_val.item(),
+            'vq_loss':         vq_loss.item(),
+            'partition_loss':  partition_loss.item() if isinstance(partition_loss, torch.Tensor) else partition_loss,
+            'atten_loss':      atten_loss.item() if isinstance(atten_loss, torch.Tensor) else atten_loss,
+            'total_loss':      total_loss.item(),
         }
 
         return interests, total_loss, loss_dict

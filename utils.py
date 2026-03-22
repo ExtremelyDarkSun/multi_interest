@@ -112,6 +112,12 @@ def get_parser():
     parser.add_argument('--vq_commitment_cost', type=float, default=0.25,
                         help='[DASD-DisMIR] VQ commitment cost beta (default: 0.25)')
 
+    # [Hard False Target] BPR with random-weight combination negatives
+    parser.add_argument('--lambda_false', type=float, default=0.5,
+                        help='weight for hard false target BPR loss')
+    parser.add_argument('--num_false_weight_sample', type=int, default=10,
+                        help='number of random weight combinations per sample for hard_false_target')
+
     return parser
 
 
