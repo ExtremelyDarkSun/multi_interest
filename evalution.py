@@ -645,7 +645,7 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                     gpu_index = faiss.GpuIndexFlatIP(res, hidden_size, flat_config)
                     gpu_index.add(item_embs)
 
-                    codebook_size = model.tokenizer.vq.num_embeddings
+                    codebook_size = getattr(args, 'vq_num_embeddings', 5000)
                     used_codes = set()  # 收集整个 valid 集上使用过的 codebook entry
 
                     total_cosine = 0.0  # for avg recon cosine diagnostic
