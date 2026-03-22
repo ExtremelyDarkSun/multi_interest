@@ -498,24 +498,26 @@ def test(device, test_file, cate_file, dataset, model_type, item_count, batch_si
 
 
 def save_teacher_weights(model, teacher_model_path):
-    """Save only the Tokenizer (Teacher) weights + shared embeddings."""
+    """Save only the Tokenizer (Teacher) weights + teacher_embeddings."""
     if not os.path.exists(teacher_model_path):
         os.makedirs(teacher_model_path)
     state = {
         'tokenizer': model.tokenizer.state_dict(),
-        'embeddings': model.dismir.embeddings.state_dict(),   # shared embedding
+        'teacher_embeddings': model.teacher_embeddings.state_dict(),
     }
     torch.save(state, teacher_model_path + 'teacher.pt')
     print(f'Teacher weights saved to {teacher_model_path}teacher.pt')
 
 
 def load_teacher_weights(model, teacher_model_path):
-    """Load Tokenizer (Teacher) weights only. dismir.embeddings is NOT restored
-    so Stage-2 always starts with freshly-initialised item embeddings."""
+    """Load Tokenizer (Teacher) weights + teacher_embeddings.
+    dismir.embeddings (Student) is intentionally NOT restored;
+    Stage-2 always starts with freshly-initialised student embeddings."""
     path = teacher_model_path + 'teacher.pt'
     state = torch.load(path, map_location='cpu')
     model.tokenizer.load_state_dict(state['tokenizer'])
-    print(f'Teacher (tokenizer) weights loaded from {path}')
+    model.teacher_embeddings.load_state_dict(state['teacher_embeddings'])
+    print(f'Teacher (tokenizer + teacher_embeddings) weights loaded from {path}')
     print('[Stage-2] dismir.embeddings kept at fresh random init (not loaded from Stage-1)')
 
 
@@ -549,10 +551,10 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
     model.load_confidence_matrix(dataset, data_path='./data/')
     model.set_sampler(args, device=device)
 
-    # Only optimise Teacher-related parameters (+ shared embedding)
+    # Only optimise Teacher-related parameters (tokenizer + teacher_embeddings)
     teacher_params = (
         list(model.tokenizer.parameters()) +
-        list(model.dismir.embeddings.parameters())
+        list(model.teacher_embeddings.parameters())
     )
     optimizer = torch.optim.Adam(teacher_params, lr=lr,
                                  weight_decay=args.weight_decay)
@@ -636,9 +638,9 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
                 total_recall, total_ndcg, total_hitrate, total = 0.0, 0.0, 0, 0
 
                 with torch.no_grad():
-                    # Prepare faiss index using teacher embeddings (trained during pretrain)
-                    # Normalize item embeddings to match recon_target (normalized in encode_with_teacher)
-                    item_embs = F.normalize(model.dismir.embeddings.weight, dim=-1).cpu().numpy()
+                    # Prepare faiss index using teacher_embeddings (Stage-1 space)
+                    # Normalize to match recon_target (normalized in encode_with_teacher)
+                    item_embs = F.normalize(model.teacher_embeddings.weight, dim=-1).cpu().numpy()
                     res = faiss.StandardGpuResources()
                     flat_config = faiss.GpuIndexFlatConfig()
                     flat_config.device = device.index
@@ -666,7 +668,7 @@ def train_teacher_pretrain(device, train_file, valid_file, dataset, model_type,
 
                         # 计算平均重建余弦相似度（诊断 VQ 瓶颈是否过强）
                         label_emb_norm = F.normalize(
-                            model.dismir.embeddings(to_tensor(target_labels, device)).detach(), dim=-1
+                            model.teacher_embeddings(to_tensor(target_labels, device)).detach(), dim=-1
                         )  # (B, D)
                         batch_cosine = (teacher_token * label_emb_norm).sum(dim=-1).mean().item()
                         total_cosine += batch_cosine

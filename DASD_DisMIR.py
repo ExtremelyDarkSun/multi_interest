@@ -62,70 +62,6 @@ class ChamferLoss(nn.Module):
 
 
 
-# ============ 4. TargetAwareFusion ============
-# NOTE: 该类当前未被使用，实际使用的是 dismir.read_out() 进行硬选择
-# 保留代码以备后续可能需要注意力融合机制
-'''
-class TargetAwareFusion(nn.Module):
-    """
-    Target-Aware Fusion (目标感知融合层)
-
-    将M个兴趣向量通过注意力机制融合为单个向量，用于主任务Loss计算。
-    仅在训练时使用，推理阶段不调用。
-
-    Args:
-        hidden_size: 隐藏层维度
-    """
-
-    def __init__(self, hidden_size):
-        super(TargetAwareFusion, self).__init__()
-        self.hidden_size = hidden_size
-
-        # 注意力投影层：将target和interest映射到同一空间
-        self.attention_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-
-        # 初始化参数
-        self._reset_parameters()
-
-    def _reset_parameters(self):
-        """初始化模型参数"""
-        nn.init.kaiming_normal_(self.attention_proj.weight, mode='fan_out', nonlinearity='relu')
-
-    def forward(self, interests, target_emb):
-        """
-        前向传播
-
-        Args:
-            interests: 兴趣向量集合 (batch_size, M, hidden_size)
-            target_emb: Target物品的嵌入向量 (batch_size, hidden_size)
-
-        Returns:
-            fused_vector: 融合后的向量 (batch_size, hidden_size)
-        """
-        # 计算每个兴趣向量与target的相似度
-        # 使用target作为query，interests作为key和value
-
-        # 将target扩展为query: (batch_size, 1, hidden_size)
-        target_query = target_emb.unsqueeze(1)  # (batch_size, 1, hidden_size)
-        target_query_proj = self.attention_proj(target_query)  # (batch_size, 1, hidden_size)
-
-        # 将interests投影: (batch_size, M, hidden_size)
-        interests_proj = self.attention_proj(interests)  # (batch_size, M, hidden_size)
-
-        # 计算注意力分数: (batch_size, 1, M)
-        attention_scores = torch.matmul(target_query_proj, interests_proj.transpose(1, 2))
-
-        # Softmax归一化得到注意力权重
-        attention_weights = F.softmax(attention_scores, dim=-1)  # (batch_size, 1, M)
-
-        # 加权求和得到融合向量
-        fused_vector = torch.matmul(attention_weights, interests)  # (batch_size, 1, hidden_size)
-        fused_vector = fused_vector.squeeze(1)  # (batch_size, hidden_size)
-
-        return fused_vector
-'''
-
-
 # ============ 3. Tokenizer 相关组件 ============
 
 class HistoryEncoderLayer(nn.Module):
@@ -180,13 +116,6 @@ class Qwen3NextRMSNorm(nn.Module):
         return output.type_as(x)
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -199,55 +128,18 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-class SimpleRotaryEmbedding(nn.Module):
-    """简化版的 RoPE，用于 ContextGatedTokenizer"""
-
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
-        super().__init__()
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-
-        # 确保 dim 是偶数
-        if dim % 2 != 0:
-            raise ValueError(f"dim must be even, got {dim}")
-
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.float32) / self.dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    @torch.no_grad()
-    def forward(self, x, seq_len=None):
-        # x: [batch_size, num_heads, seq_len, hidden_size]
-        if seq_len is None:
-            seq_len = x.shape[-2]
-
-        # 生成位置索引
-        t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
-        # freqs: [seq_len, dim//2]
-        freqs = torch.outer(t, self.inv_freq)
-        # emb: [seq_len, dim]
-        emb = torch.cat((freqs, freqs), dim=-1)
-
-        cos = emb.cos()
-        sin = emb.sin()
-
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
-
 class Qwen3NextCrossAttention(nn.Module):
     """
-    基于 Qwen3NextAttention 改造的交叉注意力模块
-
-    支持两种模式：
-    1. 第一层模式 (is_first_layer=True):
+    交叉注意力模块，支持两种模式：
+    1. 第一层 (is_first_layer=True):
        - 输入单个 target_emb [B, D]
-       - 先通过 target_proj 映射到 num_tokens * hidden_size，再切分成 num_tokens 个 query
+       - 通过 q_proj 映射到 num_tokens * hidden_size，再切分成 num_tokens 个 query
        - 输出多个 tokens [B, num_tokens, D]
 
-    2. 后续层模式 (is_first_layer=False):
+    2. 后续层 (is_first_layer=False):
        - 输入多个 tokens [B, num_tokens, D]
-       - 输出多个 tokens [B, num_tokens, D]
        - 每个 token 作为独立的 query 进行 Cross-Attention
+       - 输出多个 tokens [B, num_tokens, D]
     """
 
     def __init__(self, hidden_size, num_tokens, num_key_value_heads=None, dropout=0.1,
@@ -282,22 +174,10 @@ class Qwen3NextCrossAttention(nn.Module):
             self.num_key_value_heads * hidden_size,
             bias=False
         )
-        self.target_proj = nn.Linear(
-            hidden_size,
-            hidden_size,
-            bias=False
-        )
-
-        # Q/K 归一化 - 现在归一化整个 hidden_size 维度
+        # Q/K 归一化
         self.q_norm = Qwen3NextRMSNorm(hidden_size, eps=1e-6)
         self.k_norm = Qwen3NextRMSNorm(hidden_size, eps=1e-6)
 
-        # RoPE 位置编码 - 使用 hidden_size
-        self.rotary_emb = SimpleRotaryEmbedding(
-            hidden_size,
-            max_position_embeddings=2048
-        )
-        self.token_dropout = nn.Dropout(1 / num_tokens)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, target_emb, history_emb, key_padding_mask=None):
@@ -409,7 +289,7 @@ class VectorQuantizer(nn.Module):
 
         codebook_loss = F.mse_loss(q.detach(), flat)
         commit_loss   = F.mse_loss(q, flat.detach())
-        vq_loss       = self.commitment_cost * codebook_loss + commit_loss
+        vq_loss       = codebook_loss + self.commitment_cost * commit_loss
 
         # Dead code revival: reset rarely-used codes to random input vectors
         if self.training and self.revival_threshold > 0:
@@ -430,16 +310,13 @@ class VectorQuantizer(nn.Module):
 
 class ContextGatedTokenizer(nn.Module):
     """
-    Context-Gated Aspect Tokenizer (Teacher模型) - 使用 Qwen3NextAttention
+    Context-Gated Aspect Tokenizer (Teacher模型)
 
-    升级点:
-    1. 使用 Qwen3NextAttention 替换原有的 MultiheadAttention
-    2. 集成 RoPE 位置编码
-    3. 加入 Q/K 归一化和门控机制
-    4. num_tokens 直接对应注意力头数
-    5. 第一层将 target_emb 映射到 num_tokens * hidden_size 再切分为 num_tokens 个 query
-    6. 支持多层叠加，每层包含：Cross-Attention + Self-Attention + FFN（标准Decoder Layer）
-    7. 第一层不使用残差连接（强制模型学习用target查询history，避免target信息直接传递），后续层使用残差连接
+    结构：多层 Decoder，每层包含：
+    - 递进式 History Encoder（TransformerEncoderLayer）
+    - Cross-Attention（Q/K 归一化，第一层无残差连接）
+    - Self-Attention + FFN（TransformerEncoderLayer，含残差）
+    最终经过门控 + VQ 量化输出 num_tokens 个 aspect token。
     """
 
     def __init__(self, hidden_size, num_tokens=4, num_heads=4, num_key_value_heads=None,
@@ -468,8 +345,7 @@ class ContextGatedTokenizer(nn.Module):
         self.cross_attn_norms = nn.ModuleList()
         self.cross_attn_dropouts = nn.ModuleList()
 
-        self.self_attn_layers = nn.ModuleList()  # Self-Attention (Token Interaction)
-        self.ffn_layers = nn.ModuleList()  # Feed-Forward Network
+        self.self_attn_layers = nn.ModuleList()  # Self-Attention + FFN (TransformerEncoderLayer)
 
         for layer_idx in range(num_decoder_layers):
             # 1. Cross-Attention
@@ -519,7 +395,7 @@ class ContextGatedTokenizer(nn.Module):
         # 可选：添加温度参数来控制softmax的锐利程度
         self.gate_temperature = nn.Parameter(torch.ones(1))
 
-        self.vq = VectorQuantizer(num_embeddings, hidden_size, vq_commitment_cost, revival_threshold=0)
+        self.vq = VectorQuantizer(num_embeddings, hidden_size, vq_commitment_cost)
 
         self._reset_parameters()
 
@@ -644,7 +520,7 @@ class DASD_DisMIR(BasicModel):
     """
     DASD-DisMIR 完整封装模型
 
-    封装DisMIR (Student) + ContextGatedTokenizer (Teacher) + TargetAwareFusion + Loss计算
+    封装DisMIR (Student) + ContextGatedTokenizer (Teacher) + Loss计算
     提供统一的训练和推理接口。
 
     设计原则：
@@ -722,11 +598,6 @@ class DASD_DisMIR(BasicModel):
         self.lambda_false            = getattr(args, 'lambda_false',            0.5)
         self.num_false_weight_sample = getattr(args, 'num_false_weight_sample', 10)
 
-        # 初始化TargetAwareFusion (目标感知融合层)
-        # NOTE: 当前未使用，实际使用 dismir.read_out() 进行硬选择
-        # self.fusion = TargetAwareFusion(hidden_size)
-
-        # Loss模块 (ChamferLoss deprecated, kept for compatibility but not used)
         self.chamfer_loss = ChamferLoss()
 
         # Training phase control: 'pretrain' or 'finetune'
@@ -969,81 +840,6 @@ class DASD_DisMIR(BasicModel):
         }
         return total_loss, loss_dict
 
-    def compute_partition_loss_with_embeddings(self, items, mask, embeddings, seed=None):
-        """
-        Compute partition loss using specified embeddings (not self.dismir.embeddings).
-        This allows Teacher to use its own embeddings during pretraining.
-
-        Args:
-            items: (batch_size, seq_len) item ids
-            mask: (batch_size, seq_len) padding mask
-            embeddings: nn.Embedding to use for lookup
-            seed: Optional random seed for reproducible sampling
-
-        Returns:
-            partition_loss: scalar tensor
-        """
-        import numpy as np
-
-        if seed is not None:
-            torch.manual_seed(seed)
-            np.random.seed(seed)
-
-        batch_size, seq_len = items.shape
-        partition_groups = self.dismir.partition_groups
-        num_negatives = self.dismir.num_negatives
-        item_num = self.dismir.item_num
-
-        # Get item embeddings using provided embedding table
-        item_eb = embeddings(items)  # (B, L, D)
-        mask_expanded = mask.unsqueeze(-1).float()
-        item_eb = item_eb * mask_expanded
-
-        # Flatten for batch processing (B*L, K)
-        item_eb_flat = item_eb.view(-1, partition_groups)
-        item_weights = item_eb_flat
-
-        # Sample positive neighbors from confidence matrix (reuse dismir's method)
-        pos_samples = self.dismir.sample_positive_neighbors(items, num_pos=1)
-        pos_samples_flat = pos_samples.view(-1)
-        pos_eb = embeddings(pos_samples_flat)  # (B*L, K)
-
-        # Sample negative items
-        neg_samples = torch.randint(0, item_num,
-                                    (batch_size * seq_len, num_negatives),
-                                    device=items.device)
-        neg_eb = embeddings(neg_samples)  # (B*L, N, K)
-
-        pos_weights = pos_eb
-        neg_weights = neg_eb
-
-        # Compute similarities
-        pos_sim = (item_weights * pos_weights).sum(dim=-1)  # (B*L,)
-        neg_sim = torch.matmul(
-            item_weights.unsqueeze(1),
-            neg_weights.transpose(-2, -1)
-        ).squeeze(1)  # (B*L, N)
-
-        # InfoNCE loss
-        temperature = 1.0
-        pos_sim = torch.clamp(pos_sim / temperature, min=-10, max=10)
-        neg_sim = torch.clamp(neg_sim / temperature, min=-10, max=10)
-
-        pos_exp = torch.exp(pos_sim)
-        neg_exp = torch.exp(neg_sim).sum(dim=-1)
-
-        loss = -torch.log(pos_exp / (pos_exp + neg_exp + 1e-9))
-
-        # Apply mask
-        mask_flat = mask.view(-1).float()
-        loss = (loss * mask_flat).sum() / (mask_flat.sum() + 1e-9)
-
-        if torch.isnan(loss):
-            print(f"[Warning] partition_loss is NaN, returning 0")
-            return torch.tensor(0.0, device=items.device)
-
-        return loss
-
     # ============ 兼容DisMIR接口的方法 ============
 
     def set_device(self, device):
@@ -1072,31 +868,3 @@ class DASD_DisMIR(BasicModel):
         """
         return self.dismir.calculate_disloss(readout, pos_items, selection, interests, atten)
 
-    # NOTE: 该方法当前未被使用，实际加载Teacher权重使用 evalution.py 中的 load_teacher_weights 函数
-    # 保留代码以备后续可能需要独立加载功能
-    '''
-    def load_teacher_from_pretrain(self, checkpoint_path):
-        """
-        从预训练 checkpoint 加载 Teacher 的 embedding 权重
-
-        Args:
-            checkpoint_path: 预训练 checkpoint 路径
-        """
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-
-        # 尝试从 checkpoint 中获取 embedding 权重
-        state_dict = checkpoint.get('model_state_dict', checkpoint)
-
-        # 查找 embedding 权重（可能是 'dismir.embeddings.weight' 或 'embeddings.weight'）
-        embedding_key = None
-        for key in state_dict.keys():
-            if 'embeddings.weight' in key and 'teacher' not in key:
-                embedding_key = key
-                break
-
-        if embedding_key and embedding_key in state_dict:
-            self.teacher_embeddings.weight.data.copy_(state_dict[embedding_key])
-            print(f"Loaded teacher embedding from {embedding_key}")
-        else:
-            print("Warning: Could not find embedding weights in checkpoint")
-    '''
