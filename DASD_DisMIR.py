@@ -705,6 +705,11 @@ class DASD_DisMIR(BasicModel):
             vq_commitment_cost=getattr(args, 'vq_commitment_cost', 0.25),
         )
 
+        # Teacher 独立 Embedding（与 Student 不共享）
+        self.teacher_embeddings = nn.Embedding(
+            dismir_model.item_num, hidden_size, padding_idx=0
+        )
+
         # DDPM 线性噪声调度
         noise_T          = getattr(args, 'noise_T',          40)
         noise_beta_start = getattr(args, 'noise_beta_start', 1e-4)
@@ -784,8 +789,9 @@ class DASD_DisMIR(BasicModel):
         interests, scores, atten, readout, selection = dismir_output
 
         # 2. Teacher 前向（Stage-2 tokenizer 可训练，始终加噪）
-        label_eb   = self.dismir.embeddings(label_list).detach()   # (B, D)
-        history_eb = self.dismir.embeddings(item_list).detach()    # (B, L, D)
+        # 使用 Teacher 独立 embedding；label 保持 detach（重构目标固定），history 有梯度
+        label_eb   = self.teacher_embeddings(label_list).detach()   # (B, D)
+        history_eb = self.teacher_embeddings(item_list)             # (B, L, D)
         history_eb = history_eb * mask.unsqueeze(-1)
 
         tokenizer_input = self._apply_ddpm_noise(label_eb) if self.training else label_eb
@@ -908,9 +914,9 @@ class DASD_DisMIR(BasicModel):
         Returns:
             recon_target: (batch_size, hidden_size) - Teacher 生成的 target 表示 (单token)
         """
-        # 获取 label 和 history 的 embedding（使用统一的 dismir.embeddings）
-        label_eb = self.dismir.embeddings(label_list).detach()  # (batch_size, hidden_size)
-        history_eb = self.dismir.embeddings(item_list)  # (batch_size, seq_len, hidden_size)
+        # 使用 Teacher 独立 embedding
+        label_eb = self.teacher_embeddings(label_list).detach()  # (batch_size, hidden_size)
+        history_eb = self.teacher_embeddings(item_list)  # (batch_size, seq_len, hidden_size)
         history_eb = history_eb * mask.unsqueeze(-1)  # (batch_size, seq_len, hidden_size)
 
         # 调用 tokenizer 生成 tokens、recon_target 和 VQ indices
@@ -928,9 +934,10 @@ class DASD_DisMIR(BasicModel):
         Stage-1 Teacher-only forward pass (Simplified).
         MSE loss + Partition loss for better Teacher quality.
         """
-        # 使用统一的 dismir.embeddings（pretrain阶段不detach history_eb，让tokenizer重构梯度训练embedding）
-        label_eb   = self.dismir.embeddings(label_list).detach()  # (B, D)
-        history_eb = self.dismir.embeddings(item_list)            # (B, L, D)
+        # 使用 Teacher 独立 embedding（与 Student 不共享）
+        # label 作为重构目标，detach 防止梯度从 MSE 目标端流回
+        label_eb   = self.teacher_embeddings(label_list).detach()  # (B, D)
+        history_eb = self.teacher_embeddings(item_list)            # (B, L, D)
         history_eb = history_eb * mask.unsqueeze(-1)
 
         # [改动] 加噪（防平凡解：tokenizer 不能直接透传 label_eb）
