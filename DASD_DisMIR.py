@@ -385,6 +385,9 @@ class ContextGatedTokenizer(nn.Module):
 
         self.vq = VectorQuantizer(num_embeddings, hidden_size, vq_commitment_cost)
 
+        # 简单的输出归一化
+        self.output_norm = nn.LayerNorm(hidden_size)
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -489,8 +492,8 @@ class ContextGatedTokenizer(nn.Module):
             context = self.self_attn_layers[layer_idx](context)
 
         # ===== 最终处理 =====
-        # 去掉 Gating，直接归一化
-        tokens = self.norm_gate(context)
+        # 输出归一化
+        tokens = self.output_norm(context)
 
         # VQ 量化
         quantized_tokens, vq_loss, vq_indices = self.vq(tokens)   # [B, K, D], scalar, [B, K]
