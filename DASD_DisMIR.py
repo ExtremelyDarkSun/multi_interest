@@ -376,24 +376,12 @@ class ContextGatedTokenizer(nn.Module):
             )
             self.self_attn_layers.append(self_attn_ffn)
 
-        # --- Gating Block (用于最后的门控) ---
-        self.value_proj = nn.Linear(hidden_size, hidden_size)
-        self.norm_gate = Qwen3NextRMSNorm(hidden_size, eps=1e-6)
-
-        # --- Step 5: Token 互注意力组合模块（替代 recon_proj）---
+        # --- Step 5: Token 聚合模块（单 query 注意力聚合 K tokens）---
+        # 去掉 gating，使用注意力机制直接学习聚合权重
         self.combine_q   = nn.Linear(hidden_size, hidden_size, bias=False)
         self.combine_k   = nn.Linear(hidden_size, hidden_size, bias=False)
         self.combine_out = nn.Linear(hidden_size, hidden_size, bias=False)
         self.combine_scale = hidden_size ** -0.5
-
-        self.dimension_gate = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, hidden_size)
-        )
-        # 可选：添加温度参数来控制softmax的锐利程度
-        self.gate_temperature = nn.Parameter(torch.ones(1))
 
         self.vq = VectorQuantizer(num_embeddings, hidden_size, vq_commitment_cost)
 
@@ -407,25 +395,38 @@ class ContextGatedTokenizer(nn.Module):
     def combine_tokens(self, tokens: torch.Tensor,
                        override_weights: torch.Tensor = None) -> torch.Tensor:
         """
-        用 token 互注意力组合 K 个 token → 单向量表示
+        用单 query 注意力聚合 K 个 token → 单向量表示
 
         Args:
             tokens:           [B, K, D]
-            override_weights: [B, K, K] 可选。若传入则跳过学习到的注意力权重，
-                              直接使用此矩阵（用于生成 hard_false_target）
+            override_weights: [B, K] 或 [B, N, K] 可选。若传入则直接使用此权重，
+                              跳过学习到的注意力计算（用于生成 hard_false_target）
         Returns:
-            combined: [B, D]
+            combined: [B, D] 或 [B, N, D]（与 override_weights 维度对齐）
         """
         if override_weights is None:
-            Q = self.combine_q(tokens)                                    # [B, K, D]
-            K = self.combine_k(tokens)                                    # [B, K, D]
-            attn = torch.bmm(Q, K.transpose(1, 2)) * self.combine_scale  # [B, K, K]
-            weights = F.softmax(attn, dim=-1)                             # [B, K, K]
+            # 单 query：使用 tokens 的 mean 作为全局 query
+            Q = self.combine_q(tokens.mean(dim=1, keepdim=True))  # [B, 1, D]
+            K = self.combine_k(tokens)                            # [B, K, D]
+            attn = torch.bmm(Q, K.transpose(1, 2)) * self.combine_scale  # [B, 1, K]
+            weights = F.softmax(attn, dim=-1)                     # [B, 1, K]
+            # 加权求和: [B, 1, K] @ [B, K, D] -> [B, 1, D] -> [B, D]
+            out = torch.bmm(weights, tokens).squeeze(1)           # [B, D]
         else:
-            weights = override_weights                                    # [B, K, K]
+            # override_weights: [B, K] 或 [B, N, K]
+            if override_weights.dim() == 2:
+                # [B, K] -> [B, 1, K] for bmm
+                weights = override_weights.unsqueeze(1)           # [B, 1, K]
+                out = torch.bmm(weights, tokens).squeeze(1)       # [B, D]
+            else:
+                # [B, N, K] -> [B*N, 1, K], tokens -> [B*N, K, D]
+                B, N, K = override_weights.shape
+                weights = override_weights.view(B * N, 1, K)      # [B*N, 1, K]
+                tokens_exp = tokens.unsqueeze(1).expand(-1, N, -1, -1).reshape(B * N, K, -1)  # [B*N, K, D]
+                out = torch.bmm(weights, tokens_exp).squeeze(1)   # [B*N, D]
+                out = out.view(B, N, -1)                          # [B, N, D]
 
-        out = torch.bmm(weights, tokens).mean(dim=1)   # [B, D]（K 个输出取均值）
-        return self.combine_out(out)                   # [B, D]
+        return self.combine_out(out) if override_weights is None or override_weights.dim() == 2 else out
 
     def forward(self, target_emb, history_emb, mask):
         """
@@ -438,7 +439,6 @@ class ContextGatedTokenizer(nn.Module):
             tokens: [batch_size, num_tokens, hidden_size] - 生成的 aspect tokens
             reconstructed: [batch_size, hidden_size] - 重构的 target embedding
         """
-        target_emb = target_emb.detach()
         batch_size = target_emb.size(0)
 
         # 转换 mask: True 表示 padding/ignore
@@ -489,21 +489,13 @@ class ContextGatedTokenizer(nn.Module):
             context = self.self_attn_layers[layer_idx](context)
 
         # ===== 最终处理 =====
-        # Gating
+        # 去掉 Gating，直接归一化
         tokens = self.norm_gate(context)
 
-        gate_logits = self.dimension_gate(tokens)  # [B, num_tokens, hidden_size]
-        # 使用温度参数控制softmax锐利程度（可选）
-        gate_logits = gate_logits / torch.clamp(self.gate_temperature, min=0.1)
-        # 在token维度上进行softmax，确保每个维度上所有token权重和为1
-        gate_weights = F.softmax(gate_logits, dim=1)  # [B, num_tokens, hidden_size]
-        # 应用门控权重
-        gated_tokens = tokens * gate_weights  # [B, num_tokens, hidden_size]
+        # VQ 量化
+        quantized_tokens, vq_loss, vq_indices = self.vq(tokens)   # [B, K, D], scalar, [B, K]
 
-        # VQ 量化（保留 idx 用于 codebook 利用率统计）
-        quantized_tokens, vq_loss, vq_indices = self.vq(gated_tokens)   # [B, K, D], scalar, [B, K]
-
-        # 互注意力组合 K tokens → recon
+        # 单 query 注意力聚合 K tokens → recon
         reconstructed = self.combine_tokens(quantized_tokens)   # [B, D]
 
         # 返回：
@@ -645,6 +637,8 @@ class DASD_DisMIR(BasicModel):
                 None
         """
         # === Pretrain Phase: Only train Teacher ===
+        # NOTE: train_teacher_pretrain() 始终直接调用 forward_teacher_pretrain()，
+        # 不经过此处。此分支仅作为安全兜底，防止误用 model(...) 进入 pretrain 阶段。
         if train and self.training_phase == 'pretrain':
             return self.forward_teacher_pretrain(item_list, label_list, mask, times, device)
 
@@ -688,20 +682,15 @@ class DASD_DisMIR(BasicModel):
             K_   = quantized_tokens.shape[1]
             N_f  = self.num_false_weight_sample  # 默认 10
 
-            # 为每个样本采样 N_f 组 [K, K] 随机权重 → [B, N_f, K, K]
-            rand_logits  = torch.rand(B_, N_f, K_, K_, device=device)
-            rand_weights = F.softmax(rand_logits, dim=-1)            # [B, N_f, K, K]
+            # 为每个样本采样 N_f 组 [K] 随机权重 → [B, N_f, K]
+            rand_logits  = torch.rand(B_, N_f, K_, device=device)
+            rand_weights = F.softmax(rand_logits, dim=-1)            # [B, N_f, K]
 
             with torch.no_grad():
-                # 对 N_f 组权重批量调用 combine_tokens
-                tokens_exp  = quantized_tokens.unsqueeze(1).expand(
-                                  -1, N_f, -1, -1
-                              ).reshape(B_ * N_f, K_, -1)           # [B*N_f, K, D]
-                rand_w_flat = rand_weights.reshape(B_ * N_f, K_, K_) # [B*N_f, K, K]
-                false_flat  = self.tokenizer.combine_tokens(
-                                  tokens_exp, override_weights=rand_w_flat
-                              )                                       # [B*N_f, D]
-                hard_false_targets = false_flat.reshape(B_, N_f, -1) # [B, N_f, D]
+                # 直接调用 combine_tokens，传入 [B, N_f, K] 权重
+                hard_false_targets = self.tokenizer.combine_tokens(
+                    quantized_tokens, override_weights=rand_weights
+                )                                                      # [B, N_f, D]
 
             pos_eb_false  = self.dismir.embeddings(label_list)            # [B, D]，有梯度
             pos_scores_f  = (readout * pos_eb_false).sum(dim=-1)          # [B]
@@ -811,8 +800,9 @@ class DASD_DisMIR(BasicModel):
         history_eb = self.teacher_embeddings(item_list)            # (B, L, D)
         history_eb = history_eb * mask.unsqueeze(-1)
 
-        # [改动] 加噪（防平凡解：tokenizer 不能直接透传 label_eb）
-        noisy_label_eb = self._apply_ddpm_noise(label_eb)
+        # 加噪（防平凡解：tokenizer 不能直接透传 label_eb）
+        # eval 模式下不加噪，使 val_recon_loss 与 recall 评估条件一致
+        noisy_label_eb = self._apply_ddpm_noise(label_eb) if self.training else label_eb
 
         quantized_tokens, recon_target, vq_loss, _ = self.tokenizer(noisy_label_eb, history_eb, mask)
 
